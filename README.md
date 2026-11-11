@@ -1,6 +1,6 @@
 # AI Pharmacy Order Agent — backend
 
-Express 5 (ESM) · TypeScript · Prisma 7 · PostgreSQL. REST API, AI conversation engine, speech and telephony adapters (mock by default), order management with stock reservations, staff approvals and exception handling for an AI phone order agent for wholesale pharmacies. The staff dashboard lives in the separate `Ai-calling-fronted` repository.
+Express 5 (ESM) · TypeScript · Prisma 7 · PostgreSQL. REST API, AI conversation engine, speech and telephony adapters (mock by default), order management with stock reservations, staff approvals and exception handling for an AI phone order agent for wholesale pharmacies. The staff dashboard lives in the separate `Ai-calling-fronted` repository. Architecture, build-step reports and screenshots are in [Ai-calling-docs](https://github.com/Muhammedminhaj798/Ai-calling-docs); the API contract is §B of its [ARCHITECTURE.md](https://github.com/Muhammedminhaj798/Ai-calling-docs/blob/main/ARCHITECTURE.md).
 
 ## Run
 
