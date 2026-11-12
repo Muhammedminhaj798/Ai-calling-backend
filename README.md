@@ -23,4 +23,13 @@ npm run test:integration      # needs TEST_DATABASE_URL pointing at a dedicated 
 npm run smoke                 # against a running server
 ```
 
+## Deploy (Render)
+
+```bash
+npm ci --include=dev && npm run build    # build command
+npm start                                # start command
+```
+
+`--include=dev` is required. When dev dependencies are omitted (e.g. `NODE_ENV=production`), `typescript` is still installed as an optional peer of `@prisma/client`, but `@types/express`, `@types/cors` and `@types/ws` are not, so `tsc` fails with TS7016.
+
 Never commit `.env`; it is ignored. Only `.env.example` with placeholder values is tracked.
