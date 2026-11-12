@@ -34,8 +34,17 @@ const EnvSchema = z.object({
   RESERVATION_SWEEP_INTERVAL_SECONDS: z.coerce.number().int().min(0).max(3600).default(60),
 
   // --- AI conversation engine (build step 4) ---
-  // mock = scripted provider for tests/dev; openai = real model calls (needs OPENAI_API_KEY)
-  AI_PROVIDER: z.enum(['mock', 'openai']).default('mock'),
+  // mock = scripted provider for tests/dev; anthropic = Claude (needs ANTHROPIC_API_KEY); openai = Chat
+  // Completions (needs OPENAI_API_KEY). A failing real provider hands the call to staff, never to the mock.
+  AI_PROVIDER: z.enum(['mock', 'openai', 'anthropic']).default('mock'),
+  ANTHROPIC_API_KEY: z.string().min(1).optional(),
+  ANTHROPIC_MODEL: z.string().min(1).default('claude-opus-5-5'),
+  // Thinking depth (always on): low keeps phone-call latency down; raise to medium if measured quality drops
+  ANTHROPIC_EFFORT: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('low'),
+  ANTHROPIC_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(20_000),
+  // USD per 1M tokens, used only to fill usage_costs; 0 records tokens without a cost
+  ANTHROPIC_PRICE_INPUT_USD_PER_1M: z.coerce.number().min(0).default(0),
+  ANTHROPIC_PRICE_OUTPUT_USD_PER_1M: z.coerce.number().min(0).default(0),
   OPENAI_API_KEY: z.string().min(1).optional(),
   OPENAI_MODEL: z.string().min(1).default('gpt-4.1-mini'),
   OPENAI_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(20_000),
@@ -68,6 +77,7 @@ const EnvSchema = z.object({
     path: ['INVENTORY_ADAPTER'],
   })
   .refine((e) => e.AI_PROVIDER !== 'openai' || Boolean(e.OPENAI_API_KEY), { message: 'OPENAI_API_KEY is required when AI_PROVIDER=openai', path: ['AI_PROVIDER'] })
+  .refine((e) => e.AI_PROVIDER !== 'anthropic' || Boolean(e.ANTHROPIC_API_KEY), { message: 'ANTHROPIC_API_KEY is required when AI_PROVIDER=anthropic', path: ['AI_PROVIDER'] })
   .refine((e) => (e.STT_PROVIDER !== 'google' && e.TTS_PROVIDER !== 'google') || Boolean(e.GOOGLE_SPEECH_API_KEY), {
     message: 'GOOGLE_SPEECH_API_KEY is required when STT_PROVIDER or TTS_PROVIDER is google',
     path: ['GOOGLE_SPEECH_API_KEY'],

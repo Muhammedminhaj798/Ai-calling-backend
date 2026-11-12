@@ -1,6 +1,7 @@
 // Wires the configured model provider and the single orchestrator instance.
 import { env } from '../../config/env.ts';
 import type { AiProvider } from '../../integrations/ai/ai.port.ts';
+import { createAnthropicProvider } from '../../integrations/ai/anthropic.adapter.ts';
 import { scriptedAiProvider } from '../../integrations/ai/mock.adapter.ts';
 import { createOpenAiProvider } from '../../integrations/ai/openai.adapter.ts';
 import { callsSessionStore } from '../calls/calls.store.ts';
@@ -12,9 +13,11 @@ let orchestrator: Orchestrator | undefined;
 
 export function getAiProvider(): AiProvider {
   if (!provider) {
-    provider = env.AI_PROVIDER === 'openai'
-      ? createOpenAiProvider({ apiKey: env.OPENAI_API_KEY!, model: env.OPENAI_MODEL, timeoutMs: env.OPENAI_TIMEOUT_MS })
-      : scriptedAiProvider;
+    provider = env.AI_PROVIDER === 'anthropic'
+      ? createAnthropicProvider({ apiKey: env.ANTHROPIC_API_KEY!, model: env.ANTHROPIC_MODEL, effort: env.ANTHROPIC_EFFORT, timeoutMs: env.ANTHROPIC_TIMEOUT_MS })
+      : env.AI_PROVIDER === 'openai'
+        ? createOpenAiProvider({ apiKey: env.OPENAI_API_KEY!, model: env.OPENAI_MODEL, timeoutMs: env.OPENAI_TIMEOUT_MS })
+        : scriptedAiProvider;
   }
   return provider;
 }

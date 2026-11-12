@@ -250,7 +250,7 @@ export interface FakeStore extends SessionStore {
   readonly transcripts: Array<{ speaker: string; text: string; language: string; toolCalls?: unknown }>;
   readonly events: Array<{ type: string; fromState?: string; toState?: string; toolName?: string; ok?: boolean; data?: unknown }>;
   readonly patches: Array<Record<string, unknown>>;
-  readonly usage: Array<{ inputTokens: number; outputTokens: number }>;
+  readonly usage: Array<{ provider: string; model: string; inputTokens: number; outputTokens: number }>;
 }
 
 export function createFakeStore(): FakeStore {
@@ -273,7 +273,7 @@ export function createFakeStore(): FakeStore {
       patches.push({ ...patch });
     },
     async recordUsage(_callId, u) {
-      usage.push({ inputTokens: u.inputTokens, outputTokens: u.outputTokens });
+      usage.push({ provider: u.provider, model: u.model, inputTokens: u.inputTokens, outputTokens: u.outputTokens });
     },
   };
 }

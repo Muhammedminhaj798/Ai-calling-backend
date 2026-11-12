@@ -1,5 +1,6 @@
-// Port for the conversation model provider. The orchestrator only ever sees these shapes; the OpenAI
-// adapter maps them to Chat Completions, the mock replays scripted responses for tests and local runs.
+// Port for the conversation model provider. The orchestrator only ever sees these shapes; the Anthropic
+// adapter maps them to the Claude Messages API, the OpenAI adapter to Chat Completions, and the mock replays
+// scripted responses for tests and local runs.
 
 export interface ToolCall {
   id: string;
@@ -41,6 +42,6 @@ export class AiProviderError extends Error {
 }
 
 export interface AiProvider {
-  readonly name: 'mock' | 'openai';
+  readonly name: 'mock' | 'openai' | 'anthropic';
   complete(messages: ChatMessage[], tools: ToolDefinition[], opts?: { temperature?: number }): Promise<AiCompletion>;
 }

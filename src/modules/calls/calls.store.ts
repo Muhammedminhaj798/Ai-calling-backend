@@ -46,9 +46,10 @@ export const callsSessionStore: SessionStore = {
   },
 
   async recordUsage(callId, usage) {
+    const anthropic = usage.provider === 'anthropic';
     const rows = [
-      { units: usage.inputTokens, unitType: 'input_tokens', price: env.OPENAI_PRICE_INPUT_USD_PER_1M },
-      { units: usage.outputTokens, unitType: 'output_tokens', price: env.OPENAI_PRICE_OUTPUT_USD_PER_1M },
+      { units: usage.inputTokens, unitType: 'input_tokens', price: anthropic ? env.ANTHROPIC_PRICE_INPUT_USD_PER_1M : env.OPENAI_PRICE_INPUT_USD_PER_1M },
+      { units: usage.outputTokens, unitType: 'output_tokens', price: anthropic ? env.ANTHROPIC_PRICE_OUTPUT_USD_PER_1M : env.OPENAI_PRICE_OUTPUT_USD_PER_1M },
     ].filter((r) => r.units > 0);
     if (rows.length === 0) return;
     await callsRepository.addUsage(

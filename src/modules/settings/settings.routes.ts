@@ -15,7 +15,9 @@ settingsRouter.get('/', anyRole, (_req, res) => {
   res.json({
     environment: env.NODE_ENV,
     providers: {
-      ai: { provider: env.AI_PROVIDER, configured: Boolean(env.OPENAI_API_KEY), model: env.OPENAI_MODEL },
+      ai: env.AI_PROVIDER === 'anthropic'
+        ? { provider: env.AI_PROVIDER, configured: Boolean(env.ANTHROPIC_API_KEY), model: env.ANTHROPIC_MODEL, effort: env.ANTHROPIC_EFFORT }
+        : { provider: env.AI_PROVIDER, configured: Boolean(env.OPENAI_API_KEY), model: env.OPENAI_MODEL },
       stt: { provider: env.STT_PROVIDER, configured: Boolean(env.GOOGLE_SPEECH_API_KEY) },
       tts: { provider: env.TTS_PROVIDER, configured: Boolean(env.GOOGLE_SPEECH_API_KEY) },
       telephony: {

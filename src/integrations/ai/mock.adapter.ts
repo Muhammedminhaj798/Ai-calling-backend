@@ -40,7 +40,7 @@ export function createScriptedAiProvider(): ScriptedAiProvider {
       requests.push({ messages: [...messages], toolNames: tools.map((t) => t.name) });
       const next = queue.shift();
       if (!next) {
-        return { text: 'Mock AI provider: no scripted response is queued. Set AI_PROVIDER=openai for real conversations.', toolCalls: [], usage: { inputTokens: 0, outputTokens: 0 }, model: 'mock' };
+        return { text: 'Mock AI provider: no scripted response is queued. Set AI_PROVIDER=anthropic (or openai) for real conversations.', toolCalls: [], usage: { inputTokens: 0, outputTokens: 0 }, model: 'mock' };
       }
       return {
         text: next.text ?? null,
