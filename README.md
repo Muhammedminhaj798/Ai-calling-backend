@@ -54,4 +54,15 @@ npm start                                # start command
 
 Environment (Render → service → Environment): `NODE_ENV=production`, `DATABASE_URL`, `JWT_SECRET`, `CORS_ORIGIN`, `AI_PROVIDER=anthropic`, `ANTHROPIC_API_KEY` (as a secret value), and optionally `ANTHROPIC_MODEL`, `ANTHROPIC_EFFORT`, `ANTHROPIC_TIMEOUT_MS` and the price variables. Redeploy after saving. Then `GET /api/settings` (signed in) should report `providers.ai` as `{ provider: "anthropic", configured: true, model, effort }`. Then place one test call before taking real orders.
 
+**Behind the Vercel proxy.** The dashboard calls same-origin `/api/*` on Vercel, which proxies to this service, so the `SameSite=Strict` refresh cookie is first-party. Every `/api` response is `Cache-Control: no-store`, so the proxy never caches it. `CORS_ORIGIN` only matters for direct cross-origin callers; keep it set to the dashboard origin.
+
+**`TRUST_PROXY_HOPS`** (default `0`) controls which `X-Forwarded-For` entry becomes the client IP, for login/refresh rate limits and audit logs. At `0` every request appears to come from Render's proxy, so per-IP limits are shared by all users. That is safe but coarse. A value higher than the real number of proxies lets any client spoof its IP and dodge the limits. Set it only after measuring:
+
+1. Set `LOG_LEVEL=debug` on Render. Each request then logs `http.proxy_chain` with `remoteAddress`, `forwardedFor` and the resulting `ip`.
+2. Make one request through the dashboard (Vercel) and one directly to the Render URL, from a machine whose public IP you know.
+3. Choose the hop count whose `ip` would be your IP on the Vercel path. Vercel overwrites `X-Forwarded-For` with the visitor IP, and Render appends its own entry. Expect `2`, but go by the logs.
+4. Set `TRUST_PROXY_HOPS` to that value, and set `LOG_LEVEL` back to `info`.
+
+With `2`, callers that bypass Vercel and hit Render directly can still spoof the left-most entry. Restricting the origin to Vercel traffic (a secret header set by a Vercel route transform and checked here) closes that gap; it is not implemented.
+
 Never commit `.env`; it is ignored. Only `.env.example` with placeholder values is tracked.

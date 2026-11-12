@@ -21,6 +21,9 @@ export const requestLogger: RequestHandler = (req, res, next) => {
       status: res.statusCode,
       durationMs: Math.round(Number(process.hrtime.bigint() - start) / 1e4) / 100,
     });
+    // Debug only, to verify TRUST_PROXY_HOPS from real traffic: the proxy chain as received and the
+    // resulting req.ip. IP addresses are personal data, so enable LOG_LEVEL=debug briefly.
+    logger.debug('http.proxy_chain', { requestId, remoteAddress: req.socket.remoteAddress ?? null, forwardedFor: req.header('x-forwarded-for') ?? null, ip: req.ip ?? null });
   });
   next();
 };

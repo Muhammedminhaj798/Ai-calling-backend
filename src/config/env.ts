@@ -11,6 +11,10 @@ const EnvSchema = z.object({
     .string()
     .regex(/^postgres(ql)?:\/\//, 'must be a postgresql:// connection string'),
   CORS_ORIGIN: z.string().min(1).default('http://localhost:3000'),
+  // Number of reverse-proxy hops in front of the app whose X-Forwarded-For entries are trusted for req.ip
+  // (rate limits, audit logs). 0 = trust none, so req.ip is the connecting proxy. Set it only to a value
+  // verified from real traffic (LOG_LEVEL=debug logs the chain): too high lets clients spoof their IP.
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 
   // Staff authentication
