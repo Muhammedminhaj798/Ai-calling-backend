@@ -2,6 +2,7 @@
 // Values are never logged; only the names of invalid variables are printed.
 import 'dotenv/config';
 import { z } from 'zod';
+import { ANTHROPIC_DEFAULTS, ANTHROPIC_EFFORTS } from '../integrations/ai/anthropic.adapter.ts';
 
 const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -38,10 +39,10 @@ const EnvSchema = z.object({
   // Completions (needs OPENAI_API_KEY). A failing real provider hands the call to staff, never to the mock.
   AI_PROVIDER: z.enum(['mock', 'openai', 'anthropic']).default('mock'),
   ANTHROPIC_API_KEY: z.string().min(1).optional(),
-  ANTHROPIC_MODEL: z.string().min(1).default('claude-opus-5-5'),
+  ANTHROPIC_MODEL: z.string().min(1).default(ANTHROPIC_DEFAULTS.model),
   // Thinking depth (always on): low keeps phone-call latency down; raise to medium if measured quality drops
-  ANTHROPIC_EFFORT: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('low'),
-  ANTHROPIC_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(20_000),
+  ANTHROPIC_EFFORT: z.enum(ANTHROPIC_EFFORTS).default(ANTHROPIC_DEFAULTS.effort),
+  ANTHROPIC_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(ANTHROPIC_DEFAULTS.timeoutMs),
   // USD per 1M tokens, used only to fill usage_costs; 0 records tokens without a cost
   ANTHROPIC_PRICE_INPUT_USD_PER_1M: z.coerce.number().min(0).default(0),
   ANTHROPIC_PRICE_OUTPUT_USD_PER_1M: z.coerce.number().min(0).default(0),

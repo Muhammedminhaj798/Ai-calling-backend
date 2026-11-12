@@ -21,7 +21,12 @@ npm run typecheck && npm run lint && npm run build
 npm run test:unit
 npm run test:integration      # needs TEST_DATABASE_URL pointing at a dedicated test database
 npm run smoke                 # against a running server
+npm run ai:smoke              # one real, text-only Claude request (needs ANTHROPIC_API_KEY; costs tokens)
 ```
+
+**Integration test database guard.** The integration tests truncate every table, so `npm run test:integration` first checks (`scripts/db-guard.ts`) that `TEST_DATABASE_URL` is not the database behind `DATABASE_URL` or `DIRECT_DATABASE_URL`. It compares identities derived from the URLs, without connecting: credentials and parameters are ignored, hostnames are normalised, and a Neon pooled host is matched to its direct host by endpoint id. It allows only two cases: a different database name on the same server, or a different Neon endpoint (another branch or project). It refuses when the database is the same, when either URL cannot be identified, and when the two hosts merely differ (a DNS alias, IP, proxy or tunnel could still be one server). In that last case, after verifying the test database yourself, set `TEST_DATABASE_CONFIRMED_SEPARATE` to the identity printed in the refusal. That only unlocks that exact test identity, and never a "same database" result. `TEST_DIRECT_DATABASE_URL`, if set, must be the test database. The suites truncate only when the runner has verified the database they are connected to.
+
+**Claude smoke test.** `npm run ai:smoke` sends one text-only message through the production adapter, using `ANTHROPIC_MODEL`, `ANTHROPIC_EFFORT` and `ANTHROPIC_TIMEOUT_MS` (defaults `claude-opus-5-5`, `low`, `20000`). It invokes no tools and touches no database, orders or inventory. It prints PASS/FAIL, the serving model and token usage, never the key or headers. Exit codes: `0` success, `1` API failure, `2` not configured (nothing sent).
 
 ## AI provider (Anthropic Claude)
 

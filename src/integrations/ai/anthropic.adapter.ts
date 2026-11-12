@@ -8,7 +8,15 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { BetaContentBlockParam, BetaMessage, BetaMessageParam, BetaTool } from '@anthropic-ai/sdk/resources/beta/messages/messages';
 import { AiProviderError, type AiCompletion, type AiProvider, type ChatMessage, type ToolDefinition } from './ai.port.ts';
 
-export type AnthropicEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export const ANTHROPIC_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type AnthropicEffort = (typeof ANTHROPIC_EFFORTS)[number];
+
+/** Defaults shared by the env schema and scripts/ai-smoke.ts, so both always exercise the same model. */
+export const ANTHROPIC_DEFAULTS = { model: 'claude-opus-5-5', effort: 'low', timeoutMs: 20_000 } as const satisfies {
+  model: string;
+  effort: AnthropicEffort;
+  timeoutMs: number;
+};
 
 export interface AnthropicConfig {
   apiKey: string;

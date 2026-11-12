@@ -1,17 +1,18 @@
 // Shared helpers for PostgreSQL-backed integration tests. Run through `npm run test:integration`,
-// which points DATABASE_URL at TEST_DATABASE_URL, applies migrations first and runs the suite files
-// serially (--test-concurrency=1): they share one database and resetDb() truncates it between tests.
+// which verifies the test database is separate (scripts/db-guard.ts), points DATABASE_URL at it, applies
+// migrations first and runs the suite files serially (--test-concurrency=1): they share one database and
+// resetDb() truncates it between tests.
 import '../env.ts';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { randomUUID } from 'node:crypto';
+import { integrationGate } from '../../scripts/db-guard.ts';
 import type { CustomerStatus, StaffRole } from '../../src/generated/prisma/enums.ts';
 
-const testDb = process.env['TEST_DATABASE_URL'];
-export const dbAvailable = Boolean(testDb) && process.env['DATABASE_URL'] === testDb;
-export const skipReason = !testDb
-  ? 'TEST_DATABASE_URL not set — run `npm run test:integration` with a dedicated PostgreSQL test database'
-  : 'DATABASE_URL must equal TEST_DATABASE_URL — run through `npm run test:integration`';
+// Suites skip (and nothing is truncated) unless the runner's guard verified this exact database.
+const gate = integrationGate(process.env);
+export const dbAvailable = gate.available;
+export const skipReason = gate.reason;
 
 export interface TestServer {
   baseUrl: string;
@@ -36,6 +37,7 @@ export async function db() {
 
 /** Empties every table touched by these tests. Safe only against the dedicated test database. */
 export async function resetDb(): Promise<void> {
+  if (!dbAvailable) throw new Error(`refusing to truncate: ${skipReason}`);
   const prisma = await db();
   await prisma.$executeRawUnsafe(
     'TRUNCATE TABLE order_events, order_confirmations, stock_reservations, order_items, orders, staff_approvals, exceptions, ' +
