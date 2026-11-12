@@ -1,5 +1,6 @@
-// HTTP handlers for /api/auth. The refresh token travels in an HTTP-only cookie scoped to /api/auth
-// (and is echoed in the JSON body for non-browser clients).
+// HTTP handlers for /api/auth. The refresh token travels only in an HTTP-only cookie scoped to /api/auth: it is
+// never in a response body, and a token in a request body is ignored. Non-browser clients keep the cookie
+// (Set-Cookie in, Cookie header out) the way a browser does.
 import type { Request, RequestHandler, Response } from 'express';
 import { env } from '../../config/env.ts';
 import { currentUser } from '../../middleware/auth.ts';
@@ -14,20 +15,18 @@ export const REFRESH_COOKIE = 'refresh_token';
 const COOKIE_PATH = '/api/auth';
 
 function presentedRefreshToken(req: Request): string | undefined {
-  const fromCookie = parseCookies(req.headers.cookie)[REFRESH_COOKIE];
-  const fromBody = (req.body as { refreshToken?: string } | undefined)?.refreshToken;
-  return fromCookie ?? fromBody;
+  return parseCookies(req.headers.cookie)[REFRESH_COOKIE];
 }
 
-function sendSession(res: Response, session: AuthSession): void {
-  res.cookie(REFRESH_COOKIE, session.refreshToken, {
+function sendSession(res: Response, { refreshToken, refreshTokenExpiresAt, ...body }: AuthSession): void {
+  res.cookie(REFRESH_COOKIE, refreshToken, {
     httpOnly: true,
     sameSite: 'strict',
     secure: env.NODE_ENV === 'production',
     path: COOKIE_PATH,
-    expires: session.refreshTokenExpiresAt,
+    expires: refreshTokenExpiresAt,
   });
-  res.json(session);
+  res.json(body);
 }
 
 const login: RequestHandler = async (req, res) => {

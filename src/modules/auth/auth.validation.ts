@@ -7,8 +7,3 @@ export const loginSchema = {
   }),
 };
 export type LoginInput = z.infer<typeof loginSchema.body>;
-
-/** Refresh/logout accept the token from the HTTP-only cookie or, for non-browser clients, the JSON body. */
-export const refreshSchema = {
-  body: z.object({ refreshToken: z.string().min(20).max(500).optional() }).optional(),
-};

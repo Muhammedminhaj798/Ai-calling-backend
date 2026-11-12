@@ -167,8 +167,7 @@ export type ApiClient = ReturnType<typeof api>;
 export interface Session {
   user: TestUser;
   accessToken: string;
-  refreshToken: string;
-  /** Cookie header value carrying the refresh token */
+  /** Cookie header value carrying the refresh token (the API never returns it in a body) */
   cookie: string;
 }
 
@@ -182,5 +181,5 @@ export async function loginAs(client: ApiClient, role: StaffRole): Promise<Sessi
   const user = await createUser(role);
   const res = await client.post('/api/auth/login', { email: user.email, password: user.password });
   if (res.status !== 200) throw new Error(`login failed: ${res.status} ${res.text}`);
-  return { user, accessToken: res.body.accessToken, refreshToken: res.body.refreshToken, cookie: refreshCookie(res.setCookies) };
+  return { user, accessToken: res.body.accessToken, cookie: refreshCookie(res.setCookies) };
 }

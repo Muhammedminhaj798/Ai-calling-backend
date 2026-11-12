@@ -29,13 +29,14 @@ describe('auth API', { skip: dbAvailable ? false : skipReason }, () => {
   });
   beforeEach(resetDb);
 
-  it('logs in with valid credentials, sets the refresh cookie and never returns the password hash', async () => {
+  it('logs in with valid credentials, sets the refresh cookie and never returns the password hash or refresh token', async () => {
     const user = await createUser('admin');
     const res = await client.post('/api/auth/login', { email: user.email.toUpperCase(), password: user.password });
     assert.equal(res.status, 200);
     assert.equal(res.body.tokenType, 'Bearer');
     assert.ok(res.body.accessToken);
-    assert.ok(res.body.refreshToken);
+    assert.equal(res.body.refreshToken, undefined);
+    assert.equal(res.body.refreshTokenExpiresAt, undefined);
     assert.equal(res.body.user.email, user.email);
     assert.equal(res.body.user.passwordHash, undefined);
     assert.match(refreshCookie(res.setCookies), /^refresh_token=/);
@@ -99,16 +100,27 @@ describe('auth API', { skip: dbAvailable ? false : skipReason }, () => {
     assert.equal(res.body.error.code, 'TOKEN_EXPIRED');
   });
 
-  it('rotates refresh tokens and revokes the whole family when a used token is replayed', async () => {
+  it('rotates refresh tokens; within 30 s the previous one is refused without revoking, after that reuse revokes the family', async () => {
     const session = await loginAs(client, 'staff');
+    const prisma = await db();
+    const active = () => prisma.refreshToken.count({ where: { userId: session.user.id, revokedAt: null } });
 
     const first = await client.post('/api/auth/refresh', undefined, { cookie: session.cookie });
     assert.equal(first.status, 200);
-    assert.notEqual(first.body.refreshToken, session.refreshToken);
+    assert.equal(first.body.refreshToken, undefined);
     const secondCookie = refreshCookie(first.setCookies);
+    assert.notEqual(secondCookie, session.cookie);
 
-    // Replaying the original (already rotated) token is treated as theft.
-    const replay = await client.post('/api/auth/refresh', { refreshToken: session.refreshToken });
+    // Presented again within the grace window (lost response, concurrent refresh): refused, nothing revoked or issued.
+    const repeat = await client.post('/api/auth/refresh', undefined, { cookie: session.cookie });
+    assert.equal(repeat.status, 401);
+    assert.equal(repeat.body.error.code, 'REFRESH_TOKEN_SUPERSEDED');
+    assert.deepEqual(repeat.setCookies, []);
+    assert.equal(await active(), 1);
+
+    // Outside the window, replaying the rotated token is treated as theft…
+    await prisma.refreshToken.updateMany({ where: { userId: session.user.id, replacedById: { not: null } }, data: { revokedAt: new Date(Date.now() - 31_000) } });
+    const replay = await client.post('/api/auth/refresh', undefined, { cookie: session.cookie });
     assert.equal(replay.status, 401);
     assert.equal(replay.body.error.code, 'INVALID_REFRESH_TOKEN');
 
@@ -116,14 +128,54 @@ describe('auth API', { skip: dbAvailable ? false : skipReason }, () => {
     const afterReplay = await client.post('/api/auth/refresh', undefined, { cookie: secondCookie });
     assert.equal(afterReplay.status, 401);
 
-    const prisma = await db();
-    assert.equal(await prisma.refreshToken.count({ where: { userId: session.user.id, revokedAt: null } }), 0);
+    assert.equal(await active(), 0);
     assert.equal(await prisma.auditLog.count({ where: { action: 'auth.refresh_reuse_detected' } }), 1);
   });
 
-  it('refresh without a token or with an unknown token is rejected', async () => {
+  it('concurrent refreshes with one cookie create exactly one successor (conditional UPDATE under row locking)', async () => {
+    const session = await loginAs(client, 'staff');
+    const results = await Promise.all(Array.from({ length: 8 }, () => client.post('/api/auth/refresh', undefined, { cookie: session.cookie })));
+    assert.equal(results.filter((r) => r.status === 200).length, 1);
+    for (const r of results.filter((x) => x.status !== 200)) {
+      assert.equal(r.status, 401);
+      assert.equal(r.body.error.code, 'REFRESH_TOKEN_SUPERSEDED');
+    }
+    const prisma = await db();
+    const rows = await prisma.refreshToken.findMany({ where: { userId: session.user.id } });
+    assert.equal(rows.length, 2, 'the original token and one successor: no second chain');
+    assert.equal(rows.filter((r) => !r.revokedAt).length, 1);
+    assert.equal(await prisma.auditLog.count({ where: { action: 'auth.refresh_reuse_detected' } }), 0);
+  });
+
+  it('the grace window covers only the immediately previous token', async () => {
+    const session = await loginAs(client, 'staff');
+    const second = refreshCookie((await client.post('/api/auth/refresh', undefined, { cookie: session.cookie })).setCookies);
+    assert.equal((await client.post('/api/auth/refresh', undefined, { cookie: second })).status, 200);
+
+    const stale = await client.post('/api/auth/refresh', undefined, { cookie: session.cookie });
+    assert.equal(stale.body.error.code, 'INVALID_REFRESH_TOKEN');
+    const prisma = await db();
+    assert.equal(await prisma.refreshToken.count({ where: { userId: session.user.id, revokedAt: null } }), 0);
+  });
+
+  it('aborted refresh: logging out with the previous cookie also ends the successor that never arrived', async () => {
+    const session = await loginAs(client, 'staff');
+    const other = await loginAs(client, 'staff');
+    const undelivered = refreshCookie((await client.post('/api/auth/refresh', undefined, { cookie: session.cookie })).setCookies);
+
+    assert.equal((await client.post('/api/auth/logout', undefined, { cookie: session.cookie })).status, 204);
+    assert.equal((await client.post('/api/auth/refresh', undefined, { cookie: undelivered })).status, 401);
+    assert.equal((await client.post('/api/auth/refresh', undefined, { cookie: other.cookie })).status, 200, 'other sessions are untouched');
+  });
+
+  it('refresh without a token, with an unknown token, or with a token in the body is rejected', async () => {
     assert.equal((await client.post('/api/auth/refresh')).status, 401);
-    assert.equal((await client.post('/api/auth/refresh', { refreshToken: 'x'.repeat(64) })).status, 401);
+    assert.equal((await client.post('/api/auth/refresh', undefined, { cookie: `refresh_token=${'x'.repeat(64)}` })).status, 401);
+    // The HTTP-only cookie is the only refresh credential: a valid token in the body is ignored and not consumed.
+    const session = await loginAs(client, 'staff');
+    const viaBody = await client.post('/api/auth/refresh', { refreshToken: session.cookie.slice('refresh_token='.length) });
+    assert.equal(viaBody.status, 401);
+    assert.equal((await client.post('/api/auth/refresh', undefined, { cookie: session.cookie })).status, 200);
   });
 
   it('logout revokes the refresh token and clears the cookie', async () => {

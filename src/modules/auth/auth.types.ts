@@ -16,7 +16,9 @@ export interface AuthSession {
   tokenType: 'Bearer';
   /** Access token lifetime in seconds */
   expiresIn: number;
+  /** Cookie only: the controller sets it as the HTTP-only refresh cookie and strips it from the JSON body. */
   refreshToken: string;
+  /** Cookie only (its Expires attribute), stripped from the JSON body like refreshToken. */
   refreshTokenExpiresAt: Date;
   user: SafeUser;
 }

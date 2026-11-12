@@ -4,7 +4,7 @@ import { requireAuth } from '../../middleware/auth.ts';
 import { rateLimit } from '../../middleware/rate-limit.ts';
 import { validate } from '../../middleware/validate.ts';
 import { authController } from './auth.controller.ts';
-import { loginSchema, refreshSchema } from './auth.validation.ts';
+import { loginSchema } from './auth.validation.ts';
 
 const FIFTEEN_MINUTES = 15 * 60_000;
 
@@ -23,6 +23,7 @@ const refreshByIp = rateLimit({ windowMs: FIFTEEN_MINUTES, max: env.REFRESH_RATE
 
 export const authRouter = Router();
 authRouter.post('/login', loginByIp, loginByEmail, validate(loginSchema), authController.login);
-authRouter.post('/refresh', refreshByIp, validate(refreshSchema), authController.refresh);
-authRouter.post('/logout', validate(refreshSchema), authController.logout);
+// Refresh and logout read only the HTTP-only cookie; any request body is ignored.
+authRouter.post('/refresh', refreshByIp, authController.refresh);
+authRouter.post('/logout', authController.logout);
 authRouter.get('/me', requireAuth, authController.me);
