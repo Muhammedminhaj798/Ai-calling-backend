@@ -245,6 +245,110 @@ describe('voice loop', () => {
     assert.equal(log.clears, 1);
   });
 
+  describe('when the caller talks past a reply', () => {
+    const UTTERANCE = () => Buffer.concat([pcm(16000, 2000, 500), pcm(16000, 0, 800)]);
+    const spokeEarly = (s: ReturnType<typeof stubServices>) => s.turn.mock.calls.map((c) => (c.arguments[2] as { spokeEarly?: boolean } | undefined)?.spokeEarly === true);
+
+    /**
+     * Greeting played, then utterance 1, whose turn is held until `release`; utterance 2 is detected while it runs,
+     * so by the time turn 1 has its reply the caller has already said something newer.
+     */
+    async function talkPastFirstReply(first: TurnResult, rest: TurnResult[] = []) {
+      const s = stubServices(rest);
+      let release!: () => void;
+      s.turn.mock.mockImplementationOnce(async () => {
+        await new Promise<void>((r) => (release = r));
+        return first;
+      }, 0);
+      const { transport, log } = fakeTransport(16000);
+      const loop = createVoiceLoop(transport);
+      await loop.start(CALL);
+      await until(() => log.marks === 1, 'greeting played');
+      loop.playbackFinished();
+      loop.audio(UTTERANCE());
+      await until(() => s.turn.mock.callCount() === 1, 'turn 1 running');
+      loop.audio(UTTERANCE());
+      release();
+      return { s, log };
+    }
+
+    it('a reply the caller has already talked past is not spoken; their newer words go to the turn as spokeEarly', async () => {
+      const info = mock.method(logger, 'info');
+      const { s, log } = await talkPastFirstReply(turnResult('Which strength?'), [turnResult('Dolo 650, two strips?')]);
+      await until(() => log.marks === 2, 'second reply played');
+      assert.deepEqual(s.speak.mock.calls.map((c) => c.arguments[0]), ['Hello', 'Dolo 650, two strips?'], '"Which strength?" never synthesised');
+      assert.deepEqual(spokeEarly(s), [false, true], 'utterance 1 began after the greeting played; utterance 2 never heard reply 1');
+      const timings = info.mock.calls.filter((c) => c.arguments[0] === 'voice.turn_timing').map((c) => c.arguments[1] as { skipped?: string; ttsPieces: number });
+      assert.deepEqual(timings.map((t) => [t.skipped ?? null, t.ttsPieces]), [['superseded', 0], [null, 1]]);
+      assert.ok(info.mock.calls.some((c) => c.arguments[0] === 'voice.reply_superseded'));
+    });
+
+    const alwaysSpoken: Array<[string, TurnResult]> = [
+      ['read-back state', turnResult('Dolo 650, two strips. Shall I place the order?', 'reading_back')],
+      ['waiting for confirmation', turnResult('Shall I place the order?', 'waiting_customer_confirmation')],
+      ['generate_order_readback', { ...turnResult('Dolo 650, two strips. Correct?'), toolCalls: [{ name: 'generate_order_readback', ok: true }] }],
+      ['record_customer_confirmation', { ...turnResult('Thank you, the order is recorded.'), toolCalls: [{ name: 'record_customer_confirmation', ok: true }] }],
+      ['handover', { ...turnResult('Connecting you to staff.', 'handover_required'), toolCalls: [{ name: 'request_human_handover', ok: true }] }],
+      ['call end', turnResult('Goodbye.', 'completed', true)],
+    ];
+    for (const [what, first] of alwaysSpoken) {
+      it(`always speaks a ${what} reply, and the caller's earlier words are not taken as an answer to it`, async () => {
+        const { s, log } = await talkPastFirstReply(first);
+        await until(() => s.turn.mock.callCount() === 2, 'turn 2');
+        assert.equal(s.speak.mock.calls[1]?.arguments[0], speechPieces(first.reply)[0], 'reply 1 synthesised');
+        assert.ok(log.marks >= 2, 'reply 1 played');
+        assert.deepEqual(spokeEarly(s), [false, true], 'utterance 2 began before reply 1 started playing');
+      });
+    }
+
+    for (const [what, recognise] of [
+      ['recognised as nothing', async () => ({ text: '  ', confidence: null, language: null })],
+      ['not recognised (STT failure)', async () => Promise.reject(new Error('stt down'))],
+    ] as const) {
+      it(`a talked-past reply is spoken after all when the newer utterance is ${what}`, async () => {
+        mock.method(logger, 'error', () => undefined);
+        const info = mock.method(logger, 'info');
+        const s = stubServices();
+        s.transcribe.mock.mockImplementationOnce(recognise, 1);
+        let release!: () => void;
+        s.turn.mock.mockImplementationOnce(async () => {
+          await new Promise<void>((r) => (release = r));
+          return turnResult('Which strength?');
+        }, 0);
+        const { transport, log } = fakeTransport(16000);
+        const loop = createVoiceLoop(transport);
+        await loop.start(CALL);
+        await until(() => log.marks === 1, 'greeting played');
+        loop.playbackFinished();
+        loop.audio(UTTERANCE());
+        await until(() => s.turn.mock.callCount() === 1, 'turn 1 running');
+        loop.audio(UTTERANCE()); // a cough
+        release();
+        await until(() => log.marks === 2, 'kept reply played');
+        assert.deepEqual(s.speak.mock.calls.map((c) => c.arguments[0]), ['Hello', 'Which strength?']);
+        assert.equal(s.turn.mock.callCount(), 1, 'the noise starts no turn');
+        assert.ok(info.mock.calls.some((c) => c.arguments[0] === 'voice.deferred_reply_spoken'));
+      });
+    }
+
+    it('words begun while the greeting was still being synthesised go to the turn as spokeEarly', async () => {
+      const s = stubServices();
+      let releaseGreeting!: () => void;
+      s.speak.mock.mockImplementationOnce(async () => {
+        await new Promise<void>((r) => (releaseGreeting = r));
+        return pcm(16000, 1000, 200);
+      }, 0);
+      const { transport, log } = fakeTransport(16000);
+      const loop = createVoiceLoop(transport);
+      await loop.start(CALL);
+      await until(() => s.speak.mock.callCount() === 1, 'greeting synthesis started');
+      loop.audio(UTTERANCE());
+      releaseGreeting();
+      await until(() => log.marks === 2, 'reply played');
+      assert.deepEqual(spokeEarly(s), [true]);
+    });
+  });
+
   describe('after the caller hangs up', () => {
     const UTTERANCE = () => Buffer.concat([pcm(16000, 2000, 500), pcm(16000, 0, 800)]);
 

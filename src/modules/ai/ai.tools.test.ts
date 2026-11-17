@@ -263,6 +263,50 @@ describe('read-back, confirmation and handover', () => {
     fail(await run('record_customer_confirmation', { revision: 3, confirmed: true }), 'TOOL_NOT_ALLOWED');
   });
 
+  describe('in a turn whose words began before the previous reply was heard (customerSpokeEarly)', () => {
+    const runEarly = (name: string, args: unknown): Promise<ToolResult> => executeTool(call(name, args), { ...ctx(), customerSpokeEarly: true });
+
+    it('refuses record_customer_confirmation, whatever the arguments claim, and changes nothing', async () => {
+      await orderWithLine();
+      const revision = data(await run('generate_order_readback', {}))['revision'] as number;
+      for (const args of [
+        { revision, confirmed: true },
+        { revision, confirmed: false },
+        { revision, confirmed: true, customerSpokeEarly: false, spokeEarly: false, note: null }, // injected by the model
+      ]) {
+        const r = await runEarly('record_customer_confirmation', args);
+        fail(r, 'CONFIRMATION_NOT_HEARD');
+        assert.match(r.ok ? '' : r.error, /have not answered the read-back.*Read the order back again/);
+      }
+      assert.equal(session.state, 'waiting_customer_confirmation');
+      assert.equal(session.readbackRevision, revision);
+      assert.equal(backend.calls['confirm'], undefined);
+      assert.equal(backend.orders[0]?.status, 'pending_customer_confirmation');
+
+      // Without the flag (a later turn), the existing path confirms.
+      const confirmed = data(await run('record_customer_confirmation', { revision, confirmed: true }));
+      assert.equal(confirmed['confirmed'], true);
+      assert.equal(session.state, 'completed');
+      assert.equal(backend.calls['confirm'], 1);
+    });
+
+    it('runs every other tool normally', async () => {
+      data(await runEarly('identify_customer', { phone: CALLER }));
+      data(await runEarly('get_customer_addresses', {}));
+      data(await runEarly('create_draft_order', {}));
+      data(await runEarly('search_products', { query: 'Dolo 650' }));
+      data(await runEarly('get_product_details', { productId: 'prod-dolo-650' }));
+      data(await runEarly('check_inventory', { productId: 'prod-dolo-650', quantity: 10 }));
+      data(await runEarly('add_order_item', { productId: 'prod-dolo-650', requestedText: 'dolo', quantity: 10, confirmedDetails: { name: 'Dolo 650' } }));
+      data(await runEarly('check_inventory', { productId: 'prod-dolo-650', quantity: 12 }));
+      data(await runEarly('update_order_item', { itemId: session.order!.items[0]!.id, quantity: 12 }));
+      data(await runEarly('generate_order_readback', {}));
+      assert.equal(session.state, 'waiting_customer_confirmation');
+      data(await runEarly('request_human_handover', { reason: 'customer_requested' }));
+      assert.equal(session.state, 'handover_required');
+    });
+  });
+
   it('a declined read-back reopens the order for changes', async () => {
     await orderWithLine();
     data(await run('generate_order_readback', {}));

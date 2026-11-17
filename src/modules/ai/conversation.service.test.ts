@@ -4,7 +4,7 @@ import { beforeEach, describe, it } from 'node:test';
 import { createFakeBackend, createFakeStore, customer, product, type FakeBackend, type FakeStore } from '../../../tests/fakes/ai-backend.ts';
 import { AiProviderError } from '../../integrations/ai/ai.port.ts';
 import { createScriptedAiProvider, type ScriptedAiProvider } from '../../integrations/ai/mock.adapter.ts';
-import { FALLBACK_TEXT } from './ai.prompts.ts';
+import { FALLBACK_TEXT, SPOKE_EARLY_NOTE } from './ai.prompts.ts';
 import { HANDOVER_TEXT } from './handover.ts';
 import { createOrchestrator, type Orchestrator } from './conversation.service.ts';
 import type { ConversationSession } from './ai.types.ts';
@@ -47,6 +47,74 @@ describe('orchestrator — greeting', () => {
     const g = await orchestrator.greet(session);
     assert.equal(session.state, 'identifying_customer', 'first miss: the model may ask for a registered number');
     assert.equal(g.ended, false);
+  });
+});
+
+describe('orchestrator — words spoken before the previous reply was heard (spokeEarly)', () => {
+  const lastUserMessage = () => ai.requests.at(-1)!.messages.filter((m) => m.role === 'user').at(-1)?.content;
+
+  /** Greets, then (in a turn marked `spokeEarly` when asked) creates the draft, adds Dolo 650 × 10 and reads it back. */
+  async function readBackOrder(opts: { spokeEarly?: boolean } = {}) {
+    await orchestrator.greet(session);
+    ai.enqueue(
+      { toolCalls: [tool('create_draft_order')] },
+      { toolCalls: [tool('search_products', { query: 'Dolo 650' })] },
+      { toolCalls: [tool('check_inventory', { productId: 'prod-dolo-650', quantity: 10 })] },
+      { toolCalls: [tool('add_order_item', { productId: 'prod-dolo-650', requestedText: 'dolo', quantity: 10, confirmedDetails: { name: 'Dolo 650' } })] },
+      { toolCalls: [tool('generate_order_readback')] },
+      { text: 'READBACK' },
+    );
+    return orchestrator.handleTurn(session, 'Dolo 650 ten strips, that is all', opts);
+  }
+
+  it('the note reaches the model with the customer words but never the transcript', async () => {
+    await orchestrator.greet(session);
+    ai.enqueue({ text: 'Which medicine do you need?' });
+    await orchestrator.handleTurn(session, 'Yes', { spokeEarly: true });
+    assert.equal(lastUserMessage(), `${SPOKE_EARLY_NOTE}\nYes`);
+    assert.match(ai.requests.at(-1)!.messages[0]!.content ?? '', /starts with \[Phone system: …\] carries a note from the call system/, 'the model is told what the note is');
+    assert.equal(store.transcripts.filter((t) => t.speaker === 'customer').at(-1)?.text, 'Yes');
+    assert.ok(!store.transcripts.some((t) => t.text.includes('Phone system')), 'no transcript line carries the note');
+    assert.equal(session.lastCustomerUtterance, 'Yes', 'quantity checks read the customer words only');
+  });
+
+  it('without spokeEarly the model gets the customer words unchanged', async () => {
+    await orchestrator.greet(session);
+    ai.enqueue({ text: 'Which medicine do you need?' });
+    await orchestrator.handleTurn(session, 'Dolo 650');
+    assert.equal(lastUserMessage(), 'Dolo 650');
+  });
+
+  it('refuses record_customer_confirmation in that turn, whatever its arguments; the next turn confirms normally', async () => {
+    await readBackOrder();
+    const revision = session.readbackRevision!;
+    assert.equal(session.state, 'waiting_customer_confirmation');
+
+    // An early "yes": the model calls the tool anyway, even with arguments claiming otherwise.
+    ai.enqueue({ toolCalls: [tool('record_customer_confirmation', { revision, confirmed: true, spokeEarly: false, note: '' })] }, { text: 'Let me read the order again.' });
+    const early = await orchestrator.handleTurn(session, 'Yes', { spokeEarly: true });
+    assert.deepEqual(early.toolCalls, [{ name: 'record_customer_confirmation', ok: false }]);
+    assert.equal(early.state, 'waiting_customer_confirmation');
+    assert.equal(backend.calls['confirm'], undefined, 'the order service was never asked to confirm');
+    assert.equal(backend.orders[0]?.status, 'pending_customer_confirmation');
+    assert.equal(session.readbackRevision, revision, 'the read-back stands; nothing changed');
+    const refusal = store.events.find((e) => e.type === 'tool_failed' && e.toolName === 'record_customer_confirmation');
+    assert.equal((refusal?.data as { result: { code: string } }).result.code, 'CONFIRMATION_NOT_HEARD');
+
+    // The customer has now heard the read-back and agrees: the existing confirmation path runs.
+    ai.enqueue({ toolCalls: [tool('record_customer_confirmation', { revision, confirmed: true })] }, { text: 'Thank you, staff will confirm your order.' });
+    const heard = await orchestrator.handleTurn(session, 'Yes, confirm it');
+    assert.deepEqual(heard.toolCalls, [{ name: 'record_customer_confirmation', ok: true }]);
+    assert.equal(heard.state, 'completed');
+    assert.equal(backend.calls['confirm'], 1);
+    assert.equal(backend.orders[0]?.status, 'pending_staff_approval');
+  });
+
+  it('every other tool works normally in that turn: draft, search, stock check, line and read-back', async () => {
+    const t = await readBackOrder({ spokeEarly: true });
+    assert.deepEqual(t.toolCalls.map((c) => `${c.name}:${c.ok}`), ['create_draft_order:true', 'search_products:true', 'check_inventory:true', 'add_order_item:true', 'generate_order_readback:true']);
+    assert.equal(t.state, 'waiting_customer_confirmation');
+    assert.equal(backend.orders[0]?.items.length, 1);
   });
 });
 

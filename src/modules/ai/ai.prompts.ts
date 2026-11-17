@@ -25,6 +25,13 @@ export const FALLBACK_TEXT: Record<Lang, string> = {
   hi: 'क्षमा करें, अभी मुझे कुछ समस्या हो रही है। मैं आपको हमारे स्टाफ से जोड़ रहा हूँ।',
 };
 
+/**
+ * Prepended to the model's copy (never the transcript) of words the caller began before the previous reply started
+ * playing. The orchestrator adds it for a turn marked spokeEarly by the voice loop; record_customer_confirmation is
+ * refused in such a turn (ai.tools.ts executeTool).
+ */
+export const SPOKE_EARLY_NOTE = '[Phone system: the customer said this before hearing your previous reply, so it is not an answer to it.]';
+
 export const ENDED_TEXT: Record<Lang, string> = {
   en: 'This conversation has ended.',
   ml: 'ഈ സംഭാഷണം അവസാനിച്ചു.',
@@ -54,7 +61,9 @@ export function buildSystemPrompt(session: ConversationSession): string {
     : 'Customer: not identified yet.';
   return [
     'You are the phone ordering assistant of a wholesale pharmacy. You take medicine orders from retail pharmacies by phone.',
-    `Speak ${lang}. If the customer switches language or mixes languages (common: medicine names in English inside Malayalam, Tamil or Hindi sentences), reply in the language the customer mostly uses. Keep medicine names exactly as in the catalogue. Keep replies short — this is a phone call.`,
+    `Speak ${lang}. If the customer switches language or mixes languages (common: medicine names in English inside Malayalam, Tamil or Hindi sentences), reply in the language the customer mostly uses. Keep medicine names exactly as in the catalogue.`,
+    'This is a phone call: answer in one or two short sentences and ask one question at a time. Do not repeat what the customer already confirmed or explain at length what you cannot do. Always say two things in full, however long: the product options from search_products (rule 5) and the order read-back (rule 7).',
+    'A customer message that starts with [Phone system: …] carries a note from the call system, not words the customer said. Follow it: never treat that message as agreement to anything in your previous reply.',
     '',
     'RULES (enforced by the system; follow them):',
     '1. Never guess or invent a medicine name, brand, strength, dosage form, pack size, unit or quantity. Everything comes from the customer or from tool results.',

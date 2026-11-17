@@ -4,7 +4,7 @@ import type { ConversationState } from '../../generated/prisma/enums.ts';
 import { AiProviderError, type AiProvider, type ChatMessage } from '../../integrations/ai/ai.port.ts';
 import type { RequestMeta } from '../../utils/audit.ts';
 import { detectLanguage, resolveSessionLanguage, type Lang } from '../../utils/language.ts';
-import { CLOSING_TEXT, ENDED_TEXT, FALLBACK_TEXT, GREETING_TEXT, buildSystemPrompt } from './ai.prompts.ts';
+import { CLOSING_TEXT, ENDED_TEXT, FALLBACK_TEXT, GREETING_TEXT, SPOKE_EARLY_NOTE, buildSystemPrompt } from './ai.prompts.ts';
 import { executeTool, toolDefinitionsFor } from './ai.tools.ts';
 import { AI_ACTOR, type CallEnd, type CallEndSnapshot, type ConversationSession, type SessionStore, type ToolBackend, type TurnResult } from './ai.types.ts';
 import { canTransitionConversation, isTerminalConversation } from './conversation.state.ts';
@@ -117,7 +117,12 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       return { reply: greeting, language: session.language, state: session.state, toolCalls: [{ name: 'identify_customer', ok: result.ok }], ended: isTerminalConversation(session.state) };
     },
 
-    async handleTurn(session: ConversationSession, text: string, opts: { language?: Lang; confidence?: number | null; meta?: RequestMeta } = {}): Promise<TurnResult> {
+    /**
+     * `spokeEarly`: the caller began these words before the previous reply started playing. Set only by the voice
+     * loop from its own audio timing (the HTTP turn route never passes it). For this turn only, the model's copy of
+     * the words gets SPOKE_EARLY_NOTE (the transcript never does) and record_customer_confirmation is refused.
+     */
+    async handleTurn(session: ConversationSession, text: string, opts: { language?: Lang; confidence?: number | null; meta?: RequestMeta; spokeEarly?: boolean } = {}): Promise<TurnResult> {
       const meta = opts.meta ?? NO_META;
       if (isTerminalConversation(session.state) || session.state === 'handover_required') {
         const reply = session.state === 'handover_required' ? FALLBACK_TEXT[session.language] : ENDED_TEXT[session.language];
@@ -135,7 +140,8 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         await deps.store.recordEvent(session.callId, { type: 'language_changed', data: { language, mixed: detected.mixed, shares: detected.shares } });
       }
       await deps.store.recordTranscript(session.callId, { speaker: 'customer', text, language, confidence: opts.confidence ?? null });
-      session.messages.push({ role: 'user', content: text });
+      const spokeEarly = opts.spokeEarly === true;
+      session.messages.push({ role: 'user', content: spokeEarly ? `${SPOKE_EARLY_NOTE}\n${text}` : text });
 
       const toolCallsMade: Array<{ name: string; ok: boolean }> = [];
       let reply: string | null = null;
@@ -165,7 +171,7 @@ export function createOrchestrator(deps: OrchestratorDeps) {
         session.messages.push({ role: 'assistant', content: completion.text, toolCalls: completion.toolCalls });
         for (const call of completion.toolCalls) {
           const before = stateOf(session);
-          const result = await executeTool(call, { session, backend: deps.backend, meta, now });
+          const result = await executeTool(call, { session, backend: deps.backend, meta, now, customerSpokeEarly: spokeEarly });
           toolCallsMade.push({ name: call.name, ok: result.ok });
           let args: unknown = call.arguments;
           try {

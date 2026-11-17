@@ -134,7 +134,8 @@ export const callsService = {
     return resumeSession(await loadCall(callId));
   },
 
-  async turn(callId: string, text: string, opts: { language?: Lang; confidence?: number | null; meta?: RequestMeta } = {}): Promise<TurnResult> {
+  /** `opts.spokeEarly` is server-side only: set by the voice loop, never from a request (see the orchestrator's handleTurn). */
+  async turn(callId: string, text: string, opts: { language?: Lang; confidence?: number | null; meta?: RequestMeta; spokeEarly?: boolean } = {}): Promise<TurnResult> {
     const session = await this.getSession(callId);
     return getOrchestrator().handleTurn(session, text, opts);
   },

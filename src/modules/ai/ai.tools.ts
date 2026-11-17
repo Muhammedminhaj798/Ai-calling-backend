@@ -16,6 +16,11 @@ export interface ToolContext {
   backend: ToolBackend;
   meta: RequestMeta;
   now: () => number;
+  /**
+   * This turn's words began before the caller could hear the previous reply. Set per turn by the orchestrator from
+   * the voice loop's own audio timing (never from a request body or tool arguments); refuses confirmation.
+   */
+  customerSpokeEarly?: boolean;
 }
 
 const STOCK_CHECK_MAX_AGE_MS = 5 * 60_000;
@@ -409,6 +414,13 @@ export async function executeTool(call: ToolCall, ctx: ToolContext): Promise<Too
     result = fail('UNKNOWN_TOOL', `Unknown tool ${call.name}`);
   } else if (!isToolAllowed(call.name, session.state)) {
     result = fail('TOOL_NOT_ALLOWED', `${call.name} is not allowed while the conversation is ${session.state}`);
+  } else if (call.name === 'record_customer_confirmation' && ctx.customerSpokeEarly) {
+    // Whatever the arguments say: the customer spoke before hearing the previous reply, so this turn cannot be their
+    // answer to the read-back. Nothing changes; they confirm in a later turn, after hearing it.
+    result = fail(
+      'CONFIRMATION_NOT_HEARD',
+      'Confirmation cannot be accepted: the customer spoke before hearing your previous reply, so they have not answered the read-back. Do not treat this as agreement. Read the order back again and ask them to confirm after hearing it.',
+    );
   } else {
     let raw: unknown;
     try {

@@ -6,10 +6,17 @@
 //
 // Each answered utterance logs `voice.turn_timing`: where the time between the caller going quiet and the
 // agent's first audio went (endpointing, STT, the conversation turn, first TTS audio, hand-off to the transport).
+//
+// Turns stay strictly one at a time. A reply whose caller has already said something newer is not spoken
+// (superseded), except replies the order flow depends on (read-back, confirmation, handover, call end); it is
+// kept and spoken after all if the newer utterance turns out to be noise. Words the caller began before the
+// previous reply started playing go to the turn as spokeEarly: the orchestrator tells the model they are not an
+// answer to that reply (SPOKE_EARLY_NOTE) and the tool registry refuses record_customer_confirmation in that turn.
 import { env } from '../../config/env.ts';
+import type { ConversationState } from '../../generated/prisma/enums.ts';
 import { logger } from '../../utils/logger.ts';
 import { CLOSING_TEXT } from '../ai/ai.prompts.ts';
-import type { ConversationSession } from '../ai/ai.types.ts';
+import type { ConversationSession, TurnResult } from '../ai/ai.types.ts';
 import type { SessionEndReason } from '../ai/conversation.service.ts';
 import { callsService, type StartSessionInput } from '../calls/calls.service.ts';
 import { sessionRegistry } from '../calls/session.registry.ts';
@@ -23,6 +30,11 @@ const MIN_SPEECH_MS = 300;
 const MAX_UTTERANCE_MS = 15_000;
 /** Sentence syntheses in flight ahead of playback. */
 const TTS_PREFETCH = 3;
+
+// Replies that are spoken even when the caller has already said something newer.
+const ALWAYS_SPOKEN_STATES: ReadonlySet<ConversationState> = new Set(['reading_back', 'waiting_customer_confirmation', 'handover_required', 'completed', 'failed']);
+const ALWAYS_SPOKEN_TOOLS: ReadonlySet<string> = new Set(['generate_order_readback', 'record_customer_confirmation', 'request_human_handover']);
+const mustSpeak = (turn: TurnResult) => turn.ended || ALWAYS_SPOKEN_STATES.has(turn.state) || turn.toolCalls.some((c) => ALWAYS_SPOKEN_TOOLS.has(c.name));
 
 /**
  * A reply as sentences (. ! ? । ॥ or a line break), so playback starts once the first is synthesised instead
@@ -164,6 +176,12 @@ export function createVoiceLoop<Frame>(transport: VoiceTransport<Frame>): VoiceL
   // What the loop heard, logged once as voice.call_audio when the call ends: tells "no caller audio",
   // "too quiet for the voice detector" and "speech recognised as nothing" apart.
   const heard = { frames: 0, voicedFrames: 0, maxRms: 0, utterances: 0, sttEmpty: 0, turns: 0 };
+  // A logical clock orders "the caller began speaking" against "the last reply began playing" exactly.
+  let tick = 0;
+  let speechStartTick = 0; // start of the utterance the detector is in (or last was in)
+  let replyHeardTick = Number.POSITIVE_INFINITY; // first frame of the last reply sent; Infinity while none was
+  // The last superseded reply: spoken after all if the newer utterance is recognised as nothing.
+  let deferredReply: string | null = null;
 
   /**
    * Speaks a reply sentence by sentence, in order. A sentence that fails to synthesise ends the reply there:
@@ -171,6 +189,7 @@ export function createVoiceLoop<Frame>(transport: VoiceTransport<Frame>): VoiceL
    */
   async function speak(text: string): Promise<{ firstAudioAt: number | null; firstFrameAt: number | null; pieces: number }> {
     const timing = { firstAudioAt: null as number | null, firstFrameAt: null as number | null, pieces: 0 };
+    replyHeardTick = Number.POSITIVE_INFINITY; // until its first frame is sent, this reply has not been heard
     if (!session || ended || !transport.canPlay() || !text) return timing;
     const language = session.language;
     const pieces = speechPieces(text);
@@ -185,7 +204,10 @@ export function createVoiceLoop<Frame>(transport: VoiceTransport<Frame>): VoiceL
         for (const frame of transport.frames(pcm)) {
           if (!speaking) break; // barge-in
           await transport.send(frame);
-          timing.firstFrameAt ??= Date.now();
+          if (timing.firstFrameAt === null) {
+            timing.firstFrameAt = Date.now();
+            replyHeardTick = ++tick;
+          }
         }
       }
     } catch (err) {
@@ -195,7 +217,20 @@ export function createVoiceLoop<Frame>(transport: VoiceTransport<Frame>): VoiceL
     return timing;
   }
 
-  async function onUtterance(audio: Buffer, detectedAt: number): Promise<void> {
+  /**
+   * The utterance `seq` was recognised as nothing (or not at all): if it had superseded a reply and nothing newer
+   * is waiting, that reply is spoken now, so a cough or a click never leaves the caller in silence.
+   */
+  async function speakDeferredReply(seq: number): Promise<void> {
+    if (deferredReply === null || ended || heard.utterances !== seq) return;
+    const text = deferredReply;
+    deferredReply = null;
+    logger.info('voice.deferred_reply_spoken', { callId, replyChars: [...text].length });
+    await speak(text);
+  }
+
+  /** `seq`: the utterance's number (heard.utterances when it was detected); `startTick`: when the caller began it. */
+  async function onUtterance(audio: Buffer, detectedAt: number, seq: number, startTick: number): Promise<void> {
     if (!session || !callId || ended) return;
     const sttStart = Date.now();
     let result;
@@ -203,19 +238,33 @@ export function createVoiceLoop<Frame>(transport: VoiceTransport<Frame>): VoiceL
       result = await speechService.transcribe(audio, session.language, transport.sampleRate);
     } catch (err) {
       logger.error('media.stt_failed', { callId, message: err instanceof Error ? err.message : String(err) });
+      await speakDeferredReply(seq);
       return;
     }
     const sttDone = Date.now();
     if (!result.text.trim()) {
       heard.sttEmpty++;
+      await speakDeferredReply(seq);
       return;
     }
     // Hung up during recognition: a turn now would reopen the ended session from the database.
     if (ended) return;
     heard.turns++;
-    const turn = await callsService.turn(callId, result.text, { confidence: result.confidence });
+    deferredReply = null; // the caller said something real: the reply they talked past stays unspoken
+    // Begun before the previous reply started playing (or it never played): not an answer to that reply.
+    const spokeEarly = startTick < replyHeardTick;
+    const turn = await callsService.turn(callId, result.text, { confidence: result.confidence, ...(spokeEarly ? { spokeEarly } : {}) });
     const turnDone = Date.now();
-    const spoken = await speak(turn.reply);
+    // The caller has already said something newer: answering this now would be stale. Kept for speakDeferredReply.
+    const superseded = heard.utterances > seq && !mustSpeak(turn);
+    let spoken: Awaited<ReturnType<typeof speak>> = { firstAudioAt: null, firstFrameAt: null, pieces: 0 };
+    if (superseded) {
+      deferredReply = turn.reply;
+      replyHeardTick = Number.POSITIVE_INFINITY;
+      logger.info('voice.reply_superseded', { callId, replyChars: [...turn.reply].length, state: turn.state });
+    } else {
+      spoken = await speak(turn.reply);
+    }
     logger.info('voice.turn_timing', {
       callId,
       endpointMs: SILENCE_END_MS, // trailing silence that ends an utterance
@@ -228,6 +277,7 @@ export function createVoiceLoop<Frame>(transport: VoiceTransport<Frame>): VoiceL
       totalMs: spoken.firstFrameAt === null ? null : spoken.firstFrameAt - detectedAt + SILENCE_END_MS,
       replyChars: [...turn.reply].length,
       ttsPieces: spoken.pieces,
+      ...(superseded ? { skipped: 'superseded' } : {}),
     });
     if (turn.state === 'handover_required') await transport.transferToStaff(callId, session.providerCallSid);
     if (turn.ended && turn.state === 'completed') await speak(CLOSING_TEXT[session.language]);
@@ -264,11 +314,14 @@ export function createVoiceLoop<Frame>(transport: VoiceTransport<Frame>): VoiceL
           speaking = false; // barge-in: stop streaming agent audio
           transport.clear();
         }
+        const wasInSpeech = vad.inSpeech;
         const utterance = vad.feed(frame, rms);
+        if (!wasInSpeech && vad.inSpeech) speechStartTick = ++tick;
         if (utterance) {
-          heard.utterances++;
+          const seq = ++heard.utterances;
           const detectedAt = Date.now();
-          enqueue(() => onUtterance(utterance, detectedAt));
+          const startTick = speechStartTick;
+          enqueue(() => onUtterance(utterance, detectedAt, seq, startTick));
         }
       }
     },
