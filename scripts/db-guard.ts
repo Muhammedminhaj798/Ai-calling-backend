@@ -8,66 +8,31 @@
 //             could be one server behind a DNS alias, IP, proxy or tunnel) → refuse, unless the operator
 //             confirms this exact test identity with TEST_DATABASE_CONFIRMED_SEPARATE.
 //
-// ponytail: static URL identity only. Two Neon endpoints of one branch (a read replica) count as separate;
-// that is safe because replicas are read-only, so neither migrations nor TRUNCATE can run through them.
+// The test database must also not be any identity in PROTECTED_DATABASE_IDENTITIES (production is not in the local
+// environment, so the guard cannot otherwise know it). Without that setting nothing runs: production protection is
+// incomplete. A protected match is never overridable; an unprovable one needs the same confirmation as above.
+//
+// URL identity (parseDbIdentity and friends) lives in src/utils/db-identity.ts, shared with the server's startup
+// checks and the Prisma Migrate check; it is re-exported here for existing callers.
+import {
+  compareDbIdentity,
+  databaseUrlPairProblems,
+  formatDbIdentity,
+  parseDbIdentity,
+  parseProtectedIdentities,
+  PROTECTION_INCOMPLETE,
+  protectionVerdict,
+} from '../src/utils/db-identity.ts';
 
-export interface DbIdentity {
-  /** neon:<endpoint id> | loopback:<port> | host:<hostname>:<port> */
-  server: string;
-  database: string;
-}
-
-export type Verdict = 'same' | 'separate' | 'unknown';
-
-const LOOPBACK = /^(localhost|127(?:\.\d{1,3}){3}|::1|0\.0\.0\.0)$/;
-// libpq lets query parameters override what the URL appears to say; we cannot reason about those.
-const OVERRIDING_PARAMS = ['host', 'hostaddr', 'port', 'dbname', 'service'];
-
-/** Credential-free identity of a PostgreSQL connection URL, or the reason it cannot be determined. */
-export function parseDbIdentity(raw: string | undefined): DbIdentity | { error: string } {
-  if (!raw?.trim()) return { error: 'not set' };
-  let url: URL;
-  try {
-    url = new URL(raw.trim());
-  } catch {
-    return { error: 'not a valid URL' };
-  }
-  if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') return { error: 'not a postgres:// or postgresql:// URL' };
-  const overriding = OVERRIDING_PARAMS.filter((p) => url.searchParams.has(p));
-  if (overriding.length > 0) return { error: `query parameters override the target (${overriding.join(', ')})` };
-  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
-  if (!host) return { error: 'no host (Unix socket or libpq defaults)' };
-  if (host.includes(',')) return { error: 'multiple hosts' };
-  let database: string;
-  try {
-    database = decodeURIComponent(url.pathname.replace(/^\//, ''));
-  } catch {
-    return { error: 'database name is not valid percent-encoding' };
-  }
-  if (!database || database.includes('/')) return { error: 'no single database name in the path' };
-
-  const port = url.port || '5432';
-  // Neon routes by endpoint id, not IP: "ep-x-pooler.<region>.neon.tech" and "ep-x.<region>.neon.tech" are one
-  // compute. The endpoint may also be named in options=endpoint=<id> for clients without SNI.
-  const optionsEndpoint = /(?:^|\s)(?:endpoint|project)=([\w-]+)/.exec(url.searchParams.get('options') ?? '')?.[1];
-  const neonEndpoint = host.endsWith('.neon.tech') ? (optionsEndpoint ?? host.split('.')[0]!.replace(/-pooler$/, '')) : undefined;
-  if (neonEndpoint?.startsWith('ep-')) return { server: `neon:${neonEndpoint.toLowerCase()}`, database };
-  if (LOOPBACK.test(host)) return { server: `loopback:${port}`, database };
-  return { server: `host:${host}:${port}`, database };
-}
-
-export function compareDbIdentity(a: DbIdentity, b: DbIdentity): Verdict {
-  if (a.server === b.server) return a.database === b.database ? 'same' : 'separate';
-  if (a.server.startsWith('neon:') && b.server.startsWith('neon:')) return 'separate';
-  return 'unknown';
-}
-
-export const formatDbIdentity = (id: DbIdentity) => `${id.server}/${id.database}`;
+export { compareDbIdentity, formatDbIdentity, parseDbIdentity, type DbIdentity, type Verdict } from '../src/utils/db-identity.ts';
 
 export type GuardResult = { ok: true; identity: string } | { ok: false; reason: string };
 
 /** Decides whether TEST_DATABASE_URL may be migrated and truncated, given the application's database URLs. */
 export function checkTestDatabase(env: Record<string, string | undefined>): GuardResult {
+  const protectedIds = parseProtectedIdentities(env['PROTECTED_DATABASE_IDENTITIES']);
+  if (!protectedIds.ok) return { ok: false, reason: protectedIds.reason };
+  if (protectedIds.identities.length === 0) return { ok: false, reason: PROTECTION_INCOMPLETE };
   if (!env['TEST_DATABASE_URL']?.trim()) return { ok: false, reason: 'TEST_DATABASE_URL is not set' };
   const test = parseDbIdentity(env['TEST_DATABASE_URL']);
   if ('error' in test) return { ok: false, reason: `TEST_DATABASE_URL identity cannot be verified: ${test.error}` };
@@ -97,18 +62,39 @@ export function checkTestDatabase(env: Record<string, string | undefined>): Guar
       return { ok: false, reason: 'TEST_DIRECT_DATABASE_URL must point at the same database as TEST_DATABASE_URL' };
     }
   }
+
+  // Each environment's pooled and direct URLs must be one database, and a direct URL must not be a Neon pooler.
+  const pairProblems = [...databaseUrlPairProblems(env, ''), ...databaseUrlPairProblems(env, 'TEST_')];
+  if (pairProblems.length > 0) return { ok: false, reason: pairProblems.join('; ') };
+
+  // Never a protected database. TEST_DIRECT_DATABASE_URL is the same database as TEST_DATABASE_URL (checked above).
+  const verdict = protectionVerdict(test, protectedIds.identities);
+  if (verdict === 'same') return { ok: false, reason: `TEST_DATABASE_URL (${identity}) is a protected database (PROTECTED_DATABASE_IDENTITIES)` };
+  if (verdict === 'unknown' && !confirmed) {
+    return {
+      ok: false,
+      reason: `cannot prove TEST_DATABASE_URL (${identity}) is not a protected database: different hosts may still be one server. ` +
+        `If you have verified it is a dedicated test database, set TEST_DATABASE_CONFIRMED_SEPARATE=${identity}`,
+    };
+  }
   return { ok: true, identity };
 }
 
 /** Env var the runner sets after checkTestDatabase passes; the test helpers truncate only when it matches. */
 export const VERIFIED_IDENTITY_ENV = 'INTEGRATION_TEST_DB_IDENTITY';
 
-/** Gate for tests/integration/setup.ts: inside the runner DATABASE_URL is the verified test database. */
+/**
+ * Gate for tests/integration/setup.ts: inside the runner DATABASE_URL is the verified test database. Re-checks the
+ * protected identities, so setting the verified-identity variable by hand never opens a protected database.
+ */
 export function integrationGate(env: Record<string, string | undefined>): { available: boolean; reason: string } {
   const testDb = env['TEST_DATABASE_URL'];
   if (!testDb) return { available: false, reason: 'TEST_DATABASE_URL not set — run `npm run test:integration` with a dedicated PostgreSQL test database' };
+  const protectedIds = parseProtectedIdentities(env['PROTECTED_DATABASE_IDENTITIES']);
+  if (!protectedIds.ok || protectedIds.identities.length === 0) return { available: false, reason: protectedIds.ok ? PROTECTION_INCOMPLETE : protectedIds.reason };
   const test = parseDbIdentity(testDb);
-  const verified = env['DATABASE_URL'] === testDb && !('error' in test) && env[VERIFIED_IDENTITY_ENV] === formatDbIdentity(test);
+  if ('error' in test || protectionVerdict(test, protectedIds.identities) === 'same') return { available: false, reason: 'the test database is not identifiable or is protected' };
+  const verified = env['DATABASE_URL'] === testDb && env[VERIFIED_IDENTITY_ENV] === formatDbIdentity(test);
   return verified
     ? { available: true, reason: '' }
     : { available: false, reason: 'test database not verified by the guard — run through `npm run test:integration`' };

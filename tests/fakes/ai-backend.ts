@@ -1,8 +1,10 @@
 // In-memory implementations of the two engine seams (ToolBackend, SessionStore) for unit tests.
 // They mirror the real services' rules closely enough to exercise the tool layer and orchestrator
 // without a database: order states, revisions, read-back/confirmation binding, stock checks, exceptions.
+import type { ConversationState } from '../../src/generated/prisma/enums.ts';
 import { AppError } from '../../src/middleware/error-handler.ts';
-import type { CandidateProduct, CustomerSummary, OrderLineSnapshot, OrderSnapshot, SessionStore, ToolBackend } from '../../src/modules/ai/ai.types.ts';
+import { AI_ACTOR, type CandidateProduct, type CustomerSummary, type OrderLineSnapshot, type OrderSnapshot, type SessionStore, type ToolBackend } from '../../src/modules/ai/ai.types.ts';
+import { isTerminalConversation } from '../../src/modules/ai/conversation.state.ts';
 import { buildReadbackText } from '../../src/modules/orders/orders.pricing.ts';
 import type { ReadbackLine } from '../../src/modules/orders/orders.types.ts';
 import { normalizePhone } from '../../src/utils/phone.ts';
@@ -14,6 +16,7 @@ export interface FakeProduct extends CandidateProduct {
 
 export interface FakeOrder extends OrderSnapshot {
   callId: string;
+  customerId: string;
   pendingRevision: number | null;
   confirmations: Array<{ revision: number; idempotencyKey: string | null }>;
   reserved: boolean;
@@ -100,7 +103,7 @@ export function createFakeBackend(seed: { customers?: CustomerSummary[]; product
       const existing = orders.find((o) => o.callId === input.callId);
       if (existing) return snap(existing);
       void idempotencyKey;
-      const o: FakeOrder = { id: `order-${++seq}`, orderNumber: `PO-TEST-${seq}`, status: 'draft', revision: 1, totalPaise: 0, items: [], callId: input.callId, pendingRevision: null, confirmations: [], reserved: false };
+      const o: FakeOrder = { id: `order-${++seq}`, orderNumber: `PO-TEST-${seq}`, status: 'draft', revision: 1, totalPaise: 0, items: [], callId: input.callId, customerId: input.customerId, pendingRevision: null, confirmations: [], reserved: false };
       orders.push(o);
       return snap(o);
     },
@@ -253,11 +256,19 @@ export interface FakeStore extends SessionStore {
   readonly usage: Array<{ provider: string; model: string; inputTokens: number; outputTokens: number }>;
 }
 
-export function createFakeStore(): FakeStore {
+/**
+ * `backend`: where endCall finds the call's order and raises its exception (the database store reads the order and
+ * raises the exception in its end transaction). Like the database store, the first end wins, an end is decided from
+ * the committed conversation state, and updateCall is ignored once the call has ended or its conversation finished.
+ */
+export function createFakeStore(opts: { backend?: FakeBackend } = {}): FakeStore {
   const transcripts: FakeStore['transcripts'] = [];
   const events: FakeStore['events'] = [];
   const patches: FakeStore['patches'] = [];
   const usage: FakeStore['usage'] = [];
+  const committed = new Map<string, ConversationState>();
+  const ended = new Set<string>();
+  const finished = (callId: string) => ended.has(callId) || isTerminalConversation(committed.get(callId) ?? 'initializing');
   return {
     transcripts,
     events,
@@ -269,8 +280,24 @@ export function createFakeStore(): FakeStore {
     async recordEvent(_callId, event) {
       events.push({ type: event.type, fromState: event.fromState, toState: event.toState, toolName: event.toolName, ok: event.ok, data: event.data });
     },
-    async updateCall(_callId, patch) {
+    async updateCall(callId, patch) {
+      if (finished(callId)) return;
       patches.push({ ...patch });
+      if (patch.conversationState) committed.set(callId, patch.conversationState);
+    },
+    async endCall(callId, endedAt, decide) {
+      if (ended.has(callId)) return { conversationState: committed.get(callId)!, ended: false };
+      const order = opts.backend?.orders.find((o) => o.callId === callId);
+      const end = decide({
+        conversationState: committed.get(callId) ?? 'initializing',
+        order: order ? { id: order.id, orderNumber: order.orderNumber, status: order.status, customerId: order.customerId, lines: order.items.length } : null,
+      });
+      if (end.exception) await opts.backend?.raiseException(end.exception, AI_ACTOR);
+      if (end.event) events.push({ type: 'session_ended', fromState: end.event.fromState, toState: end.event.toState, data: end.event.data });
+      patches.push({ conversationState: end.conversationState, status: end.status, endedAt, ...(end.aiSummary !== undefined ? { aiSummary: end.aiSummary } : {}) });
+      committed.set(callId, end.conversationState);
+      ended.add(callId);
+      return { conversationState: end.conversationState, ended: true };
     },
     async recordUsage(_callId, u) {
       usage.push({ provider: u.provider, model: u.model, inputTokens: u.inputTokens, outputTokens: u.outputTokens });

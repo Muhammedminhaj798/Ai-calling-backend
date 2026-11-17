@@ -122,11 +122,41 @@ export interface ToolBackend {
   raiseException(input: RaiseExceptionInput, actor: Actor): Promise<{ id: string }>;
 }
 
+export type CallEndStatus = 'completed' | 'handed_over' | 'failed';
+
+/**
+ * The call as committed when its end is decided, read while no other end of it can run: the conversation state,
+ * and the order taken on the call, if any (`lines`: every line on it).
+ */
+export interface CallEndSnapshot {
+  conversationState: ConversationState;
+  order: { id: string; orderNumber: string; status: OrderStatus; customerId: string; lines: number } | null;
+}
+
+/**
+ * How an end closes the call: the final conversation state and call status, and, for an end that closes a live
+ * conversation, the summary, the session_ended event and the exception to raise. Written together, once.
+ */
+export interface CallEnd {
+  conversationState: ConversationState;
+  status: CallEndStatus;
+  aiSummary?: string;
+  event?: { fromState: ConversationState; toState: ConversationState; data: unknown };
+  exception?: RaiseExceptionInput;
+}
+
 /** What the orchestrator records about a session. The real implementation writes calls, transcripts, call_events, usage_costs. */
 export interface SessionStore {
   recordTranscript(callId: string, entry: { speaker: 'customer' | 'agent' | 'system'; text: string; language: Lang; confidence?: number | null; toolCalls?: unknown }): Promise<void>;
   recordEvent(callId: string, event: { type: string; fromState?: ConversationState; toState?: ConversationState; toolName?: string; toolCallId?: string; ok?: boolean; data?: unknown }): Promise<void>;
-  updateCall(callId: string, patch: { conversationState?: ConversationState; status?: 'in_progress' | 'completed' | 'handed_over' | 'failed'; language?: Lang; customerId?: string | null; handoverReason?: string | null; endedAt?: Date; aiSummary?: string | null }): Promise<void>;
+  /** Live updates. Never applied to a call that has ended or whose conversation has finished (completed, failed). */
+  updateCall(callId: string, patch: { conversationState?: ConversationState; status?: 'in_progress' | 'handed_over'; language?: Lang; customerId?: string | null; handoverReason?: string | null }): Promise<void>;
+  /**
+   * Ends the call exactly once, whichever process or connection asks first: `decide` gets the committed call and
+   * its result is written with the end time, duration, event and exception as one unit. An end that arrives during
+   * or after it writes nothing and returns the state that end committed (`ended: false`).
+   */
+  endCall(callId: string, endedAt: Date, decide: (call: CallEndSnapshot) => CallEnd): Promise<{ conversationState: ConversationState; ended: boolean }>;
   recordUsage(callId: string, usage: { provider: string; model: string; inputTokens: number; outputTokens: number }): Promise<void>;
 }
 

@@ -9,6 +9,7 @@ import { inventoryRouter } from './modules/inventory/inventory.routes.ts';
 import { ordersRouter } from './modules/orders/orders.routes.ts';
 import { productsRouter } from './modules/products/products.routes.ts';
 import { settingsRouter, staffRouter } from './modules/settings/settings.routes.ts';
+import { voiceRouter } from './modules/voice/voice.routes.ts';
 
 export const apiRouter = Router();
 apiRouter.use('/auth', authRouter);
@@ -22,3 +23,4 @@ apiRouter.use('/calls', callsRouter);
 apiRouter.use('/conversations', conversationsRouter);
 apiRouter.use('/settings', settingsRouter);
 apiRouter.use('/staff', staffRouter);
+apiRouter.use('/voice', voiceRouter);

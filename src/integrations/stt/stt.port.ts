@@ -1,5 +1,5 @@
 // Speech-to-text port. Utterance-level recognition: the telephony layer cuts the caller's audio at
-// silence boundaries (see modules/telephony/telephony.media.ts) and sends one utterance at a time, so a
+// silence boundaries (see modules/voice/voice.loop.ts) and sends one utterance at a time, so a
 // synchronous recognise call is enough and no streaming/gRPC dependency is needed.
 import type { Lang } from '../../utils/language.ts';
 
@@ -26,7 +26,7 @@ export class SpeechProviderError extends Error {
 }
 
 export interface SttAdapter {
-  readonly name: 'mock' | 'google';
+  readonly name: 'mock' | 'google' | 'sarvam';
   /** `audio` is 16-bit little-endian mono PCM at `opts.sampleRate`. */
   recognize(audio: Buffer, opts: SttOptions): Promise<SttResult>;
 }

@@ -1,15 +1,24 @@
-// Development-only seed. Creates (or resets) one admin staff user from SEED_ADMIN_EMAIL and
-// SEED_ADMIN_PASSWORD. With --samples it also inserts clearly fake products, mock inventory rows
-// and one customer so the mock inventory adapter's behaviours (-OOS, -ERR, -NA) can be exercised.
-//   npm run seed            → admin only
+// Development-only seed. Creates one admin staff user from SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD if that email is
+// unused; an existing account keeps its password, role and active flag unless --reset-admin is given. With --samples
+// (NODE_ENV=development only) it also inserts clearly fake products, mock inventory rows and one customer so the mock
+// inventory adapter's behaviours (-OOS, -ERR, -NA) can be exercised.
+//   npm run seed                      → admin only
 //   npm run seed -- --samples
+//   npm run seed -- --reset-admin     → also resets the existing admin's password, role and active flag
+// Before any write (scripts/seed-guard.ts): refuses production, protected database identities
+// (PROTECTED_DATABASE_IDENTITIES) and the integration-test database, prints the masked target and asks the operator
+// to type its database name. Interactive terminal only.
 import 'dotenv/config';
+import { createInterface } from 'node:readline/promises';
 import { z } from 'zod';
-import { prisma } from '../src/config/db.ts';
-import { hashPassword } from '../src/modules/auth/auth.tokens.ts';
+import { checkSeedTarget, ensureStaffUser, seedConfirmed } from '../scripts/seed-guard.ts';
 
-if (process.env['NODE_ENV'] === 'production') {
-  console.error('Refusing to run the development seed with NODE_ENV=production');
+const samples = process.argv.includes('--samples');
+const resetAdmin = process.argv.includes('--reset-admin');
+
+const target = checkSeedTarget(process.env, { samples });
+if (!target.ok) {
+  console.error(`Refusing to seed: ${target.reason}. Nothing was written.`);
   process.exit(1);
 }
 
@@ -26,15 +35,29 @@ if (!seedEnv.success) {
 }
 
 const { SEED_ADMIN_EMAIL: email, SEED_ADMIN_PASSWORD: password } = seedEnv.data;
-const passwordHash = await hashPassword(password);
-const admin = await prisma.staffUser.upsert({
-  where: { email },
-  update: { passwordHash, role: 'admin', isActive: true },
-  create: { email, passwordHash, name: 'Administrator', role: 'admin' },
-});
-console.log(`Admin user ready: ${admin.email} (${admin.id})`);
 
-if (process.argv.includes('--samples')) {
+console.log(`Seed target: ${target.masked}`);
+console.log(`Will write: admin account (create if missing${resetAdmin ? ', reset if present' : ''})${samples ? ', sample products, inventory, customer and staff accounts' : ''}.`);
+if (!process.stdin.isTTY) {
+  console.error('Refusing to seed: run it in an interactive terminal to confirm the target. Nothing was written.');
+  process.exit(2);
+}
+const rl = createInterface({ input: process.stdin, output: process.stdout });
+const typed = await rl.question(`Type the database name (${target.database}) to write to it: `);
+rl.close();
+if (!seedConfirmed(typed, target.database)) {
+  console.error('Not confirmed. Nothing was written.');
+  process.exit(2);
+}
+
+// Loaded only now: nothing reaches the database before the target is checked and confirmed.
+const { prisma } = await import('../src/config/db.ts');
+const { hashPassword } = await import('../src/modules/auth/auth.tokens.ts');
+const passwordHash = await hashPassword(password);
+const admin = await ensureStaffUser(prisma, { email, passwordHash, name: 'Administrator', role: 'admin' }, { reset: resetAdmin });
+console.log(`Admin user ${email}: ${admin === 'unchanged' ? 'already exists, left unchanged (use --reset-admin to reset it)' : admin}`);
+
+if (samples) {
   const products = [
     { externalCode: 'MOCK-PARA-650', name: 'Mockamol 650', brand: 'Mockamol', genericName: 'Paracetamol', strength: '650 mg', form: 'tablet', packSize: '15x10', unit: 'strip', manufacturer: 'Mock Pharma Ltd', mrpPaise: 3200, ptrPaise: 2560, stock: 1200 },
     { externalCode: 'MOCK-AMOX-500-OOS', name: 'Mockxicillin 500', brand: 'Mockxicillin', genericName: 'Amoxicillin', strength: '500 mg', form: 'capsule', packSize: '10x10', unit: 'strip', manufacturer: 'Mock Pharma Ltd', mrpPaise: 9800, ptrPaise: 7840, stock: 0 },
@@ -63,8 +86,9 @@ if (process.argv.includes('--samples')) {
     },
   });
   // Two more mock staff accounts (same seed password) so the dashboard's role-based UI can be exercised.
+  // Created if missing; existing accounts are left unchanged.
   for (const [role, mail] of [['staff', 'staff@example.com'], ['approver', 'approver@example.com']] as const) {
-    await prisma.staffUser.upsert({ where: { email: mail }, update: { passwordHash, role, isActive: true }, create: { email: mail, passwordHash, name: `Mock ${role}`, role } });
+    await ensureStaffUser(prisma, { email: mail, passwordHash, name: `Mock ${role}`, role });
   }
   console.log(`Sample data ready: ${products.length} mock products, mock inventory rows, 1 mock customer, staff@example.com + approver@example.com (seed password)`);
 }

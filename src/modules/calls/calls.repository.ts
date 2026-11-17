@@ -16,11 +16,38 @@ const listInclude = {
   order: { select: { id: true, orderNumber: true, status: true } },
 } satisfies Prisma.CallInclude;
 
+/**
+ * endedAt and durationSeconds for ending a call, or null when it has already ended: the first end wins (calls.store.ts
+ * endCall, under the call's row lock). A duration
+ * already on the row (a telephony provider's own figure) is kept; otherwise it is startedAt → endedAt in whole
+ * seconds, never negative.
+ */
+export function callClosing(call: { startedAt: Date; endedAt: Date | null; durationSeconds: number | null }, endedAt: Date): { endedAt: Date; durationSeconds: number } | null {
+  if (call.endedAt) return null;
+  return { endedAt, durationSeconds: call.durationSeconds ?? Math.max(0, Math.round((endedAt.getTime() - call.startedAt.getTime()) / 1000)) };
+}
+
 export const callsRepository = {
   create: (data: Prisma.CallUncheckedCreateInput) => prisma.call.create({ data, include: callDetailInclude }),
   findById: (id: string) => prisma.call.findUnique({ where: { id }, include: callDetailInclude }),
   findByProviderSid: (providerCallSid: string) => prisma.call.findUnique({ where: { providerCallSid }, include: callDetailInclude }),
+  /** Calls with no end and nothing recorded since `before` (no state change, no transcript line), oldest first. */
+  findAbandoned: (before: Date, take = 50) =>
+    prisma.call
+      .findMany({
+        where: {
+          endedAt: null,
+          OR: [{ lastActivityAt: { lt: before } }, { lastActivityAt: null, startedAt: { lt: before } }],
+          transcripts: { none: { createdAt: { gte: before } } },
+        },
+        select: { id: true },
+        orderBy: { startedAt: 'asc' },
+        take,
+      })
+      .then((rows) => rows.map((r) => r.id)),
+  /** Provider facts (duration, recording URL). Call state and ends go through calls.store.ts, never through here. */
   update: (id: string, data: Prisma.CallUncheckedUpdateInput) => prisma.call.update({ where: { id }, data }),
+
   list(where: Prisma.CallWhereInput, orderBy: Prisma.CallOrderByWithRelationInput, skip: number, take: number) {
     return Promise.all([prisma.call.findMany({ where, orderBy, skip, take, include: listInclude }), prisma.call.count({ where })]);
   },

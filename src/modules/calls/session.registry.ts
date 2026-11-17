@@ -11,15 +11,9 @@ export const sessionRegistry = {
   set: (session: ConversationSession) => sessions.set(session.callId, session),
   delete: (callId: string) => sessions.delete(callId),
   size: () => sessions.size,
-  /** Sessions idle for longer than `idleMs`, removed from the registry and returned for closing. */
-  takeIdle(idleMs: number, now = Date.now()): ConversationSession[] {
-    const idle: ConversationSession[] = [];
-    for (const [id, s] of sessions) {
-      if (now - s.lastActivityAt > idleMs) {
-        sessions.delete(id);
-        idle.push(s);
-      }
-    }
-    return idle;
-  },
+  /**
+   * Sessions idle for longer than `idleMs`. They stay registered: callsService.endSession removes a session only once
+   * its end has committed, so one whose end fails is found again by the next sweep.
+   */
+  idle: (idleMs: number, now = Date.now()): ConversationSession[] => [...sessions.values()].filter((s) => now - s.lastActivityAt > idleMs),
 };

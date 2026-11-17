@@ -18,8 +18,12 @@ settingsRouter.get('/', anyRole, (_req, res) => {
       ai: env.AI_PROVIDER === 'anthropic'
         ? { provider: env.AI_PROVIDER, configured: Boolean(env.ANTHROPIC_API_KEY), model: env.ANTHROPIC_MODEL, effort: env.ANTHROPIC_EFFORT }
         : { provider: env.AI_PROVIDER, configured: Boolean(env.OPENAI_API_KEY), model: env.OPENAI_MODEL },
-      stt: { provider: env.STT_PROVIDER, configured: Boolean(env.GOOGLE_SPEECH_API_KEY) },
-      tts: { provider: env.TTS_PROVIDER, configured: Boolean(env.GOOGLE_SPEECH_API_KEY) },
+      stt: env.STT_PROVIDER === 'sarvam'
+        ? { provider: env.STT_PROVIDER, configured: Boolean(env.SARVAM_API_KEY), model: env.SARVAM_STT_MODEL, language: env.SARVAM_STT_LANGUAGE }
+        : { provider: env.STT_PROVIDER, configured: Boolean(env.GOOGLE_SPEECH_API_KEY) },
+      tts: env.TTS_PROVIDER === 'sarvam'
+        ? { provider: env.TTS_PROVIDER, configured: Boolean(env.SARVAM_API_KEY), model: env.SARVAM_TTS_MODEL, speaker: env.SARVAM_TTS_SPEAKER }
+        : { provider: env.TTS_PROVIDER, configured: Boolean(env.GOOGLE_SPEECH_API_KEY) },
       telephony: {
         provider: env.TELEPHONY_PROVIDER,
         configured: Boolean(env.EXOTEL_WEBHOOK_SECRET),
@@ -27,6 +31,7 @@ settingsRouter.get('/', anyRole, (_req, res) => {
         ipAllowListConfigured: Boolean(env.EXOTEL_ALLOWED_IPS),
       },
       inventory: { provider: env.INVENTORY_ADAPTER, configured: Boolean(env.CLIENT_INVENTORY_BASE_URL && env.CLIENT_INVENTORY_API_KEY) },
+      livekit: { enabled: env.LIVEKIT_ENABLED, configured: Boolean(env.LIVEKIT_URL && env.LIVEKIT_API_KEY && env.LIVEKIT_API_SECRET), agentName: env.LIVEKIT_AGENT_NAME },
     },
     reservation: { ttlHours: env.RESERVATION_TTL_HOURS, sweepIntervalSeconds: env.RESERVATION_SWEEP_INTERVAL_SECONDS, maxOrderItems: env.MAX_ORDER_ITEMS },
     conversation: {

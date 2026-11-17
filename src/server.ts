@@ -38,12 +38,19 @@ if (env.RESERVATION_SWEEP_INTERVAL_SECONDS > 0) {
         .catch((err: unknown) => logger.error('reservations.sweep_failed', { message: err instanceof Error ? err.message : String(err) }));
     }, env.RESERVATION_SWEEP_INTERVAL_SECONDS * 1000),
   );
+  const idleMs = env.CONVERSATION_IDLE_TIMEOUT_MINUTES * 60_000;
   timers.push(
     setInterval(() => {
       callsService
-        .closeIdleSessions(env.CONVERSATION_IDLE_TIMEOUT_MINUTES * 60_000)
+        .closeIdleSessions(idleMs)
         .then((n) => {
           if (n > 0) logger.info('conversations.idle_closed', { count: n });
+        })
+        // Twice the idle timeout: the process that owns a call (this one, another instance, a voice worker job) has had
+        // its own idle close first; what is left has no live owner.
+        .then(() => callsService.closeAbandonedCalls(2 * idleMs))
+        .then((n) => {
+          if (n > 0) logger.info('conversations.abandoned_closed', { count: n });
         })
         .catch((err: unknown) => logger.error('conversations.sweep_failed', { message: err instanceof Error ? err.message : String(err) }));
     }, 60_000),

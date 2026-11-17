@@ -8,7 +8,7 @@ export interface TtsOptions {
 }
 
 export interface TtsAdapter {
-  readonly name: 'mock' | 'google';
+  readonly name: 'mock' | 'google' | 'sarvam';
   synthesize(text: string, opts: TtsOptions): Promise<Buffer>;
 }
 

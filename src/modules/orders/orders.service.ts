@@ -43,6 +43,17 @@ async function loadOrder(db: Db, id: string): Promise<OrderDetailRecord> {
   return order;
 }
 
+/**
+ * The AI may record a confirmation only while its call is live. FOR SHARE on the call row conflicts with the
+ * FOR NO KEY UPDATE that ends the call (calls.store.ts endCall), so a confirmation and an end of the same call run
+ * one after the other: an end committed first makes this throw; a confirmation committed first is what the end then
+ * reads. Taken before any order row, the same order as the end (call row, then the order), so the two cannot deadlock.
+ */
+async function lockLiveCall(db: Db, callId: string): Promise<void> {
+  const [call] = await db.$queryRaw<Array<{ endedAt: Date | null }>>`SELECT ended_at AS "endedAt" FROM calls WHERE id = ${callId}::uuid FOR SHARE`;
+  if (call?.endedAt) throw new AppError(409, 'CALL_ENDED', 'The call has ended; the confirmation was not recorded', { callId });
+}
+
 async function withEvents(order: OrderDetailRecord): Promise<OrderDetail> {
   return { ...order, events: await repo.events(order.id) };
 }
@@ -119,6 +130,8 @@ async function addLine(db: Db, order: { id: string; customerId: string; callId: 
     flagReason,
   });
   await repo.addEvent(db, { orderId: order.id, type: 'item_flagged', ...actorFields(actor), data: { itemId: item.id, lineNo, requestedText: input.requestedText, flagReason } });
+  // In the line's transaction: the line, its exception and the exception's audit row commit together, and a failed
+  // audit write rolls the line back (utils/audit.ts). The caller sees the error and can add the line again.
   await exceptionsService.raise(
     {
       type: FLAG_EXCEPTION[flagReason],
@@ -342,7 +355,12 @@ export const ordersService = {
     return { confirmationId: confirmation.id, orderId: id, revision: order.revision, status: 'pending_customer_confirmation', lines, flaggedRequests, readbackText };
   },
 
-  /** Records the customer's confirmation of the read-back for `revision`. Idempotent per idempotencyKey; duplicates are rejected. */
+  /**
+   * Records the customer's confirmation of the read-back for `revision`. Idempotent per idempotencyKey; duplicates are
+   * rejected. A confirmation by the AI (`phone_ai`) on an order taken on a call is refused once that call has ended
+   * (409 CALL_ENDED). Staff confirmations (`phone_staff`, `manual`) are recorded after a call-back, when the AI's call
+   * has long ended, so they are not tied to it.
+   */
   async confirm(id: string, input: ConfirmOrderInput, actor: Actor, meta: RequestMeta): Promise<OrderDetail> {
     const order = await loadOrder(prisma, id);
 
@@ -368,6 +386,7 @@ export const ordersService = {
     const confirmedAt = new Date();
     const totals = computeTotals(active.map((i) => ({ ...i, customerDecision: declined.has(i.id) ? 'declined' : 'accepted' })));
     const detail = await prisma.$transaction(async (db) => {
+      if (order.callId && input.source === 'phone_ai') await lockLiveCall(db, order.callId);
       const moved = await repo.transition(db, id, ['pending_customer_confirmation'], 'customer_confirmed', { ...totals, customerConfirmedAt: confirmedAt });
       if (!moved) throw new AppError(409, 'ORDER_STATE_CHANGED', 'Order changed while confirming; reload and retry');
       await db.orderItem.updateMany({ where: { orderId: id, status: 'active', id: { in: [...declined] } }, data: { customerDecision: 'declined' } });

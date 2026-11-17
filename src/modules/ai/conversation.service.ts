@@ -6,7 +6,7 @@ import type { RequestMeta } from '../../utils/audit.ts';
 import { detectLanguage, resolveSessionLanguage, type Lang } from '../../utils/language.ts';
 import { CLOSING_TEXT, ENDED_TEXT, FALLBACK_TEXT, GREETING_TEXT, buildSystemPrompt } from './ai.prompts.ts';
 import { executeTool, toolDefinitionsFor } from './ai.tools.ts';
-import { AI_ACTOR, type ConversationSession, type SessionStore, type ToolBackend, type TurnResult } from './ai.types.ts';
+import { AI_ACTOR, type CallEnd, type CallEndSnapshot, type ConversationSession, type SessionStore, type ToolBackend, type TurnResult } from './ai.types.ts';
 import { canTransitionConversation, isTerminalConversation } from './conversation.state.ts';
 import { HANDOVER_TEXT, triggerHandover } from './handover.ts';
 
@@ -43,9 +43,10 @@ export function createOrchestrator(deps: OrchestratorDeps) {
   async function setState(session: ConversationSession, to: ConversationState, data?: unknown): Promise<void> {
     if (session.state === to || !canTransitionConversation(session.state, to)) return;
     const from = session.state;
-    session.state = to;
+    // Persisted first: if a write fails, the session keeps the state the database has.
     await deps.store.recordEvent(session.callId, { type: 'state_changed', fromState: from, toState: to, data });
     await deps.store.updateCall(session.callId, { conversationState: to });
+    session.state = to;
   }
 
   function trimHistory(session: ConversationSession): void {
@@ -201,47 +202,61 @@ export function createOrchestrator(deps: OrchestratorDeps) {
       return { reply, language: session.language, state: finalState, toolCalls: toolCallsMade, ended: isTerminalConversation(finalState) || finalState === 'handover_required' };
     },
 
-    /** Closes the session: records how it ended, raises an exception when a draft was left unconfirmed. */
+    /**
+     * Closes the session: records how it ended, raises an exception when a draft was left unconfirmed. Safe to call
+     * from any number of processes at once: the store ends the call once (decideCallEnd on the committed call) and
+     * every caller gets the committed state. The session takes that state only after the database has it, so a
+     * failed end leaves the session as it was and can simply be retried.
+     */
     async endSession(session: ConversationSession, reason: SessionEndReason, meta: RequestMeta = NO_META): Promise<ConversationState> {
-      if (isTerminalConversation(session.state)) return session.state;
-      const before = session.state;
-      let next: ConversationState = 'completed';
-      let status: 'completed' | 'handed_over' | 'failed' = 'completed';
-
-      if (before === 'handover_required') {
-        status = 'handed_over';
-      } else if (session.order && (session.order.status === 'draft' || session.order.status === 'pending_customer_confirmation')) {
-        next = 'failed';
-        const unconfirmedReadback = session.readbackRevision !== null;
-        try {
-          await deps.backend.raiseException(
-            {
-              type: unconfirmedReadback ? 'customer_unconfirmed' : 'call_dropped_with_draft',
-              description: `Call ended (${reason}) with draft ${session.order.orderNumber} ${unconfirmedReadback ? 'read back but not confirmed' : 'incomplete'}; ${session.order.items.length} line(s) captured`,
-              callId: session.callId,
-              customerId: session.customer?.id ?? null,
-              orderId: session.order.id,
-              details: { reason, state: before, lines: session.order.items.length },
-            },
-            AI_ACTOR,
-          );
-        } catch {
-          /* recorded in the call event below regardless */
-        }
-      } else if (reason === 'provider_error') {
-        next = 'failed';
-        status = 'failed';
-      }
-
-      session.state = next;
-      await deps.store.recordEvent(session.callId, { type: 'session_ended', fromState: before, toState: next, data: { reason } });
-      await deps.store.updateCall(session.callId, { conversationState: next, status, endedAt: new Date(now()), aiSummary: summarise(session, reason) });
+      const { conversationState } = await deps.store.endCall(session.callId, new Date(now()), (call) => decideCallEnd(call, session, reason));
+      session.state = conversationState;
       void meta;
-      return next;
+      return conversationState;
     },
 
     closingText: (lang: Lang) => CLOSING_TEXT[lang],
   };
+}
+
+/**
+ * How a call ends, decided from the call as committed (`call`, read while no other end runs), not from this
+ * process's session, which another process may have moved on from. `session` only supplies the summary text.
+ * - The conversation already finished (order confirmed, or failed): it keeps its state; the call just closes.
+ * - Handover requested: the conversation completes and the call stays handed_over.
+ * - A draft or read-back order left unconfirmed: the conversation fails and an exception is raised for staff.
+ * - The order was confirmed (the confirmation committed before this end; orders.service.ts confirm locks the call
+ *   row, so it cannot commit after it): the conversation completes, whatever ended the call.
+ * - The provider reported an error: failed. Otherwise: completed.
+ */
+export function decideCallEnd(call: CallEndSnapshot, session: ConversationSession, reason: SessionEndReason): CallEnd {
+  const before = call.conversationState;
+  if (isTerminalConversation(before)) return { conversationState: before, status: before === 'completed' ? 'completed' : 'failed' };
+
+  const ended = (next: ConversationState, status: CallEnd['status'], exception?: CallEnd['exception']): CallEnd => ({
+    conversationState: next,
+    status,
+    aiSummary: summarise(session, reason),
+    event: { fromState: before, toState: next, data: { reason } },
+    ...(exception ? { exception } : {}),
+  });
+  if (before === 'handover_required') return ended('completed', 'handed_over');
+  const order = call.order;
+  if (order && (order.status === 'draft' || order.status === 'pending_customer_confirmation')) {
+    // pending_customer_confirmation: read back and not confirmed (a line change after read-back returns it to draft).
+    const unconfirmedReadback = order.status === 'pending_customer_confirmation';
+    return ended('failed', 'completed', {
+      type: unconfirmedReadback ? 'customer_unconfirmed' : 'call_dropped_with_draft',
+      description: `Call ended (${reason}) with draft ${order.orderNumber} ${unconfirmedReadback ? 'read back but not confirmed' : 'incomplete'}; ${order.lines} line(s) captured`,
+      callId: session.callId,
+      customerId: order.customerId,
+      orderId: order.id,
+      details: { reason, state: before, lines: order.lines },
+    });
+  }
+  if (order && order.status !== 'cancelled') return ended('completed', 'completed');
+  if (reason === 'provider_error') return ended('failed', 'failed');
+  return ended('completed', 'completed');
 }
 
 function summarise(session: ConversationSession, reason: SessionEndReason): string {

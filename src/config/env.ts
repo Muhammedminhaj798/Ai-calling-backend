@@ -1,8 +1,12 @@
 // Loads .env (if present) and validates process.env once at boot.
 // Values are never logged; only the names of invalid variables are printed.
+// Every module that touches the database imports config/db.ts, which imports this file first, so the database
+// protection check below runs (and exits on failure) before a PrismaClient exists: in the API, the voice worker and
+// each of its job processes, and every script that loads the app config.
 import 'dotenv/config';
 import { z } from 'zod';
 import { ANTHROPIC_DEFAULTS, ANTHROPIC_EFFORTS } from '../integrations/ai/anthropic.adapter.ts';
+import { appSharesTestDatabase, databaseUrlPairProblems, runtimeDatabaseProblem } from '../utils/db-identity.ts';
 
 const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -61,13 +65,21 @@ const EnvSchema = z.object({
   DEFAULT_LANGUAGE: z.enum(['en', 'ml', 'ta', 'hi']).default('en'),
   CONVERSATION_IDLE_TIMEOUT_MINUTES: z.coerce.number().int().min(1).max(240).default(30),
 
-  // Speech providers: mock for tests/dev; google = REST recognize/synthesize (needs GOOGLE_SPEECH_API_KEY)
-  STT_PROVIDER: z.enum(['mock', 'google']).default('mock'),
-  TTS_PROVIDER: z.enum(['mock', 'google']).default('mock'),
+  // Speech providers: mock for tests/dev; google = REST recognize/synthesize (needs GOOGLE_SPEECH_API_KEY);
+  // sarvam = Sarvam AI saaras speech-to-text / bulbul text-to-speech over REST (needs SARVAM_API_KEY)
+  STT_PROVIDER: z.enum(['mock', 'google', 'sarvam']).default('mock'),
+  TTS_PROVIDER: z.enum(['mock', 'google', 'sarvam']).default('mock'),
   GOOGLE_SPEECH_API_KEY: z.string().min(1).optional(),
+  SARVAM_API_KEY: z.string().min(1).optional(),
+  SARVAM_STT_MODEL: z.string().min(1).default('saaras:v4'),
+  // auto = Sarvam detects each utterance's language (callers switch languages); session = the session's language
+  SARVAM_STT_LANGUAGE: z.enum(['auto', 'session']).default('auto'),
+  SARVAM_TTS_MODEL: z.string().min(1).default('bulbul:v3'),
+  SARVAM_TTS_SPEAKER: z.string().regex(/^[a-z0-9_]+$/, 'a lowercase Sarvam speaker id').default('shubh'),
 
-  // Telephony: mock for tests/dev; exotel = inbound webhooks + Voicebot media stream
-  TELEPHONY_PROVIDER: z.enum(['mock', 'exotel']).default('mock'),
+  // Telephony: mock for tests/dev; exotel = inbound webhooks + Voicebot media stream; none = no phone line connected
+  // (telephony webhooks and media stream answer 404; LiveKit browser test calls are unaffected)
+  TELEPHONY_PROVIDER: z.enum(['mock', 'exotel', 'none']).default('mock'),
   // Unguessable token embedded in the webhook and media-stream URLs Exotel is configured with
   EXOTEL_WEBHOOK_SECRET: z.string().min(16).optional(),
   // Comma-separated allow-list of Exotel source IPs; empty = no IP check (secret only)
@@ -76,6 +88,19 @@ const EnvSchema = z.object({
   HANDOVER_PHONE_NUMBER: z.string().optional(),
   // Energy threshold (16-bit PCM RMS) above which a frame counts as speech
   VAD_RMS_THRESHOLD: z.coerce.number().int().min(50).max(10_000).default(450),
+
+  // LiveKit browser voice calls. POST /api/voice/sessions (this API) is off unless LIVEKIT_ENABLED=true; the
+  // voice worker (src/voice-worker.ts, a separate process) always needs URL, key and secret. Both processes must
+  // use the same values and agent name. The secret stays on the server: browsers only get short-lived tokens.
+  LIVEKIT_ENABLED: z.stringbool().default(false),
+  LIVEKIT_URL: z.url({ protocol: /^wss?$/ }).optional(),
+  LIVEKIT_API_KEY: z.string().min(1).optional(),
+  LIVEKIT_API_SECRET: z.string().min(1).optional(),
+  // Explicit-dispatch name: the API dispatches it and the worker registers under it. Use a different name per
+  // environment so a local worker never takes calls meant for another environment's database.
+  LIVEKIT_AGENT_NAME: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, 'letters, digits, - and _ only').default('pharmacy-voice'),
+  // Job processes the worker keeps warm; each one loads the whole backend, so keep this small on small instances
+  LIVEKIT_WORKER_IDLE_PROCESSES: z.coerce.number().int().min(1).max(8).default(1),
 })
   .refine((e) => e.INVENTORY_ADAPTER !== 'client_api' || (e.CLIENT_INVENTORY_BASE_URL && e.CLIENT_INVENTORY_API_KEY), {
     message: 'CLIENT_INVENTORY_BASE_URL and CLIENT_INVENTORY_API_KEY are required when INVENTORY_ADAPTER=client_api',
@@ -87,17 +112,66 @@ const EnvSchema = z.object({
     message: 'GOOGLE_SPEECH_API_KEY is required when STT_PROVIDER or TTS_PROVIDER is google',
     path: ['GOOGLE_SPEECH_API_KEY'],
   })
+  .refine((e) => (e.STT_PROVIDER !== 'sarvam' && e.TTS_PROVIDER !== 'sarvam') || Boolean(e.SARVAM_API_KEY), {
+    message: 'SARVAM_API_KEY is required when STT_PROVIDER or TTS_PROVIDER is sarvam',
+    path: ['SARVAM_API_KEY'],
+  })
   .refine((e) => e.TELEPHONY_PROVIDER !== 'exotel' || Boolean(e.EXOTEL_WEBHOOK_SECRET), {
     message: 'EXOTEL_WEBHOOK_SECRET is required when TELEPHONY_PROVIDER=exotel',
     path: ['TELEPHONY_PROVIDER'],
+  })
+  .refine((e) => !e.LIVEKIT_ENABLED || Boolean(e.LIVEKIT_URL && e.LIVEKIT_API_KEY && e.LIVEKIT_API_SECRET), {
+    message: 'LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET are required when LIVEKIT_ENABLED=true',
+    path: ['LIVEKIT_ENABLED'],
   });
 
 export type Env = z.infer<typeof EnvSchema>;
 
-const parsed = EnvSchema.safeParse(process.env);
-if (!parsed.success) {
-  console.error('Invalid environment configuration:\n' + z.prettifyError(parsed.error));
-  process.exit(1);
+/** Providers that production never runs as mock. Inventory is decided separately (see parseEnv). */
+const LIVE_ONLY_PROVIDERS = ['AI_PROVIDER', 'STT_PROVIDER', 'TTS_PROVIDER', 'TELEPHONY_PROVIDER'] as const;
+
+export type EnvResult = { ok: true; env: Env; warnings: string[] } | { ok: false; error: string };
+
+/**
+ * Validates raw variables. Production also refuses simulated providers — an unset provider defaults to mock, so a
+ * missing one is refused too — and needs INVENTORY_ADAPTER set explicitly: until the database inventory adapter
+ * exists, `mock` (the local inventory table, labelled simulated) is accepted with a warning. Outside tests the database
+ * URLs are checked too — DIRECT_DATABASE_URL a non-pooler URL of the same database, DATABASE_URL never the integration-
+ * test database — as errors in production and warnings in development. In every NODE_ENV, DATABASE_URL must not be a
+ * protected database (PROTECTED_DATABASE_IDENTITIES, required) unless production authorises exactly it
+ * (runtimeDatabaseProblem). Errors name variables and database identities, never values, credentials or URLs.
+ */
+export function parseEnv(raw: Record<string, string | undefined>): EnvResult {
+  const parsed = EnvSchema.safeParse(raw);
+  if (!parsed.success) return { ok: false, error: z.prettifyError(parsed.error) };
+  const e = parsed.data;
+  const problems: string[] = [];
+  const warnings: string[] = [];
+  const databaseProblem = runtimeDatabaseProblem(raw, e.NODE_ENV);
+  if (databaseProblem) problems.push(databaseProblem);
+  if (e.NODE_ENV === 'production') {
+    for (const name of LIVE_ONLY_PROVIDERS) {
+      if (e[name] === 'mock') {
+        problems.push(`${name} is "mock" or not set; production needs a real provider${name === 'TELEPHONY_PROVIDER' ? ' (or "none" when no phone line is connected)' : ''}`);
+      }
+    }
+    if (!raw['INVENTORY_ADAPTER']?.trim()) problems.push('INVENTORY_ADAPTER must be set explicitly in production');
+    else if (e.INVENTORY_ADAPTER === 'mock') warnings.push('INVENTORY_ADAPTER=mock: stock comes from the local inventory table and is labelled simulated');
+  }
+  // The integration runner itself sets DATABASE_URL to the test database under NODE_ENV=test.
+  if (e.NODE_ENV !== 'test') {
+    const dbProblems = databaseUrlPairProblems(raw, '');
+    if (appSharesTestDatabase(raw)) dbProblems.push('DATABASE_URL is the same database as TEST_DATABASE_URL, which integration tests truncate');
+    (e.NODE_ENV === 'production' ? problems : warnings).push(...dbProblems);
+  }
+  return problems.length > 0 ? { ok: false, error: problems.map((p) => `✖ ${p}`).join('\n') } : { ok: true, env: e, warnings };
 }
 
-export const env: Env = parsed.data;
+const result = parseEnv(process.env);
+if (!result.ok) {
+  console.error('Invalid environment configuration:\n' + result.error);
+  process.exit(1);
+}
+for (const warning of result.warnings) console.warn(`Configuration warning: ${warning}`);
+
+export const env: Env = result.env;

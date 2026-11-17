@@ -3,6 +3,7 @@ import { env } from '../../config/env.ts';
 import { createExotelTelephony } from '../../integrations/telephony/exotel.adapter.ts';
 import { mockTelephony } from '../../integrations/telephony/mock.adapter.ts';
 import type { CallStatusEvent, IncomingCallEvent, TelephonyAdapter } from '../../integrations/telephony/telephony.port.ts';
+import { AppError } from '../../middleware/error-handler.ts';
 import type { RequestMeta } from '../../utils/audit.ts';
 import { logger } from '../../utils/logger.ts';
 import { callsRepository } from '../calls/calls.repository.ts';
@@ -11,7 +12,15 @@ import { sessionRegistry } from '../calls/session.registry.ts';
 
 let adapter: TelephonyAdapter | undefined;
 
+/**
+ * The configured telephony adapter, for webhooks and the media stream. Throws 404 when no phone line is connected
+ * (TELEPHONY_PROVIDER=none) and for mock telephony in production: env.ts already refuses that at boot, and this
+ * per-request check keeps the mock's open webhooks and fixed media secret unusable in production regardless.
+ */
 export function getTelephonyAdapter(): TelephonyAdapter {
+  if (env.TELEPHONY_PROVIDER === 'none' || (env.TELEPHONY_PROVIDER === 'mock' && env.NODE_ENV === 'production')) {
+    throw new AppError(404, 'NOT_FOUND', 'Telephony is not enabled');
+  }
   if (!adapter) {
     adapter = env.TELEPHONY_PROVIDER === 'exotel'
       ? createExotelTelephony({ webhookSecret: env.EXOTEL_WEBHOOK_SECRET!, allowedIps: (env.EXOTEL_ALLOWED_IPS ?? '').split(',').map((s) => s.trim()).filter(Boolean) })

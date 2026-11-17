@@ -33,12 +33,14 @@ const startSimulation: RequestHandler = async (req, res) => {
 const turn: RequestHandler = async (req, res) => {
   const { params, body } = input(res);
   const t = body as TurnInput;
+  await service.assertNotVoiceWorkerCall(params!['id']!);
   res.json({ turn: await service.turn(params!['id']!, t.text, { language: t.language, meta: requestMeta(req, res) }) });
 };
 
 const end: RequestHandler = async (req, res) => {
   const { params, body } = input(res);
   const reason = (body as EndInput)?.reason ?? 'operator';
+  await service.assertNotVoiceWorkerCall(params!['id']!);
   const state = await service.endSession(params!['id']!, reason, requestMeta(req, res));
   res.json({ callId: params!['id'], conversationState: state });
 };

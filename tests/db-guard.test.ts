@@ -7,8 +7,12 @@ const NEON_DIRECT = 'postgresql://app:s3cret@ep-cool-river-123456.c-2.us-east-2.
 const NEON_POOLED = 'postgresql://app:other@ep-cool-river-123456-pooler.c-2.us-east-2.aws.neon.tech:5432/ai_pharmacy?sslmode=require&channel_binding=require';
 const NEON_OTHER_ENDPOINT = 'postgresql://app:s3cret@ep-quiet-lake-654321.c-2.us-east-2.aws.neon.tech/ai_pharmacy?sslmode=require';
 
+// A production identity on its own Neon endpoint; every case below runs with it unless it sets its own.
+const PROTECTED = 'neon:ep-prod-endpoint-999999/ai_pharmacy';
+const withProtected = (env: Record<string, string | undefined>) => ({ PROTECTED_DATABASE_IDENTITIES: PROTECTED, ...env });
+
 const refused = (env: Record<string, string | undefined>, pattern: RegExp) => {
-  const r = checkTestDatabase(env);
+  const r = checkTestDatabase(withProtected(env));
   assert.equal(r.ok, false, 'must refuse');
   if (!r.ok) {
     assert.match(r.reason, pattern);
@@ -16,7 +20,7 @@ const refused = (env: Record<string, string | undefined>, pattern: RegExp) => {
   }
 };
 const allowed = (env: Record<string, string | undefined>) => {
-  const r = checkTestDatabase(env);
+  const r = checkTestDatabase(withProtected(env));
   assert.equal(r.ok, true, r.ok ? '' : r.reason);
   return r.ok ? r.identity : '';
 };
@@ -45,7 +49,78 @@ describe('integration DB guard — refuses the same database', () => {
     const testDb = NEON_DIRECT.replace('/ai_pharmacy?', '/ai_pharmacy_test?');
     refused({ DATABASE_URL: NEON_OTHER_ENDPOINT, DIRECT_DATABASE_URL: testDb, TEST_DATABASE_URL: testDb }, /same database as DIRECT_DATABASE_URL/);
     refused({ DATABASE_URL: NEON_DIRECT, TEST_DATABASE_URL: testDb, TEST_DIRECT_DATABASE_URL: NEON_DIRECT }, /TEST_DIRECT_DATABASE_URL must point at the same database/);
-    allowed({ DATABASE_URL: NEON_DIRECT, TEST_DATABASE_URL: testDb, TEST_DIRECT_DATABASE_URL: testDb.replace('ep-cool-river-123456', 'ep-cool-river-123456-pooler') });
+    allowed({ DATABASE_URL: NEON_DIRECT, TEST_DATABASE_URL: testDb.replace('ep-cool-river-123456', 'ep-cool-river-123456-pooler'), TEST_DIRECT_DATABASE_URL: testDb });
+  });
+
+  it('a direct URL must not be a Neon pooler, for the test and the application database', () => {
+    const testDb = NEON_OTHER_ENDPOINT.replace('/ai_pharmacy', '/ai_pharmacy_test');
+    const testPooled = testDb.replace('ep-quiet-lake-654321', 'ep-quiet-lake-654321-pooler');
+    refused({ DATABASE_URL: NEON_DIRECT, TEST_DATABASE_URL: testPooled, TEST_DIRECT_DATABASE_URL: testPooled }, /TEST_DIRECT_DATABASE_URL is a Neon "-pooler" host/);
+    refused({ DATABASE_URL: NEON_POOLED, DIRECT_DATABASE_URL: NEON_POOLED, TEST_DATABASE_URL: testDb }, /^DIRECT_DATABASE_URL is a Neon "-pooler" host/);
+  });
+
+  it('the application pooled and direct URLs must be one database', () => {
+    refused({ DATABASE_URL: NEON_DIRECT, DIRECT_DATABASE_URL: NEON_DIRECT.replace('/ai_pharmacy?', '/other?'), TEST_DATABASE_URL: NEON_OTHER_ENDPOINT }, /DIRECT_DATABASE_URL is a different database from DATABASE_URL/);
+  });
+
+  it('different logins and parameters on one database are still the same database', () => {
+    const otherLogin = NEON_DIRECT.replace('app:s3cret', 'tester:another-password').replace('?sslmode=require', '?sslmode=verify-full&application_name=tests');
+    refused({ DATABASE_URL: NEON_DIRECT, TEST_DATABASE_URL: otherLogin }, /same database as DATABASE_URL/);
+  });
+});
+
+describe('integration DB guard — protected identities (PROTECTED_DATABASE_IDENTITIES)', () => {
+  const PROD_POOLED = 'postgresql://prod_owner:Pr0dSecret@ep-prod-endpoint-999999-pooler.c-2.us-east-2.aws.neon.tech/ai_pharmacy?sslmode=require';
+  const noSecrets = (reason: string) => assert.doesNotMatch(reason, /Pr0dSecret|prod_owner|postgresql:|neon\.tech/);
+
+  it('refuses everything while no protected identity is configured: production protection is incomplete', () => {
+    for (const value of [undefined, '', ' , ']) {
+      const r = checkTestDatabase({ PROTECTED_DATABASE_IDENTITIES: value, DATABASE_URL: NEON_DIRECT, TEST_DATABASE_URL: NEON_OTHER_ENDPOINT });
+      assert.equal(r.ok, false);
+      if (!r.ok) assert.match(r.reason, /PROTECTED_DATABASE_IDENTITIES is not set, so production protection is incomplete/);
+    }
+  });
+
+  it('refuses the production identity as the test database, pooled or direct, with any login', () => {
+    for (const url of [PROD_POOLED, PROD_POOLED.replace('-pooler', ''), PROD_POOLED.replace('prod_owner:Pr0dSecret', 'readonly:x')]) {
+      const r = checkTestDatabase(withProtected({ DATABASE_URL: NEON_DIRECT, TEST_DATABASE_URL: url }));
+      assert.equal(r.ok, false);
+      if (!r.ok) {
+        assert.match(r.reason, /is a protected database/);
+        noSecrets(r.reason);
+      }
+    }
+  });
+
+  it('no confirmation unlocks a protected database', () => {
+    refused({ DATABASE_URL: NEON_DIRECT, TEST_DATABASE_URL: PROD_POOLED, TEST_DATABASE_CONFIRMED_SEPARATE: 'neon:ep-prod-endpoint-999999/ai_pharmacy' }, /is a protected database/);
+  });
+
+  it('matches database names case-insensitively and "/*" protects every database on the endpoint', () => {
+    const env = { DATABASE_URL: NEON_DIRECT, TEST_DATABASE_URL: PROD_POOLED.replace('/ai_pharmacy?', '/scratch?') };
+    assert.equal(checkTestDatabase({ ...env, PROTECTED_DATABASE_IDENTITIES: 'neon:ep-prod-endpoint-999999/AI_Pharmacy' }).ok, true, 'another database on that endpoint');
+    assert.equal(checkTestDatabase({ ...env, PROTECTED_DATABASE_IDENTITIES: 'NEON:ep-prod-endpoint-999999-pooler/*' }).ok, false);
+    assert.equal(checkTestDatabase({ ...env, TEST_DATABASE_URL: PROD_POOLED, PROTECTED_DATABASE_IDENTITIES: 'neon:ep-prod-endpoint-999999/AI_PHARMACY' }).ok, false);
+  });
+
+  it('refuses a test database that cannot be proven separate from a protected one, unless confirmed', () => {
+    const env = { PROTECTED_DATABASE_IDENTITIES: 'host:db.prod.example.com:5432/shop', DATABASE_URL: 'postgresql://u:p@db.dev.example.com:5432/shop', TEST_DATABASE_URL: 'postgresql://u:p@db.dev.example.com:5432/shop_test' };
+    const r = checkTestDatabase(env);
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.match(r.reason, /cannot prove TEST_DATABASE_URL .* is not a protected database/);
+    assert.equal(checkTestDatabase({ ...env, TEST_DATABASE_CONFIRMED_SEPARATE: 'host:db.dev.example.com:5432/shop_test' }).ok, true);
+  });
+
+  it('refuses a malformed or URL-like entry without repeating it', () => {
+    for (const value of [PROD_POOLED, 'ep-prod-endpoint-999999/ai_pharmacy', 'neon:ep-prod-endpoint-999999', 'prod_owner:Pr0dSecret@neon:ep-x/db']) {
+      const r = checkTestDatabase({ PROTECTED_DATABASE_IDENTITIES: value, DATABASE_URL: NEON_DIRECT, TEST_DATABASE_URL: NEON_OTHER_ENDPOINT });
+      assert.equal(r.ok, false, value);
+      if (!r.ok) {
+        assert.match(r.reason, /PROTECTED_DATABASE_IDENTITIES entry 1/);
+        noSecrets(r.reason);
+        assert.ok(!r.reason.includes('ep-prod-endpoint'), 'the entry is never echoed');
+      }
+    }
   });
 });
 
@@ -53,7 +128,7 @@ describe('integration DB guard — allows only provably separate databases', () 
   it('different database names on the same server', () => {
     const id = allowed({ DATABASE_URL: NEON_DIRECT, DIRECT_DATABASE_URL: NEON_DIRECT, TEST_DATABASE_URL: NEON_POOLED.replace('/ai_pharmacy?', '/ai_pharmacy_test?') });
     assert.equal(id, 'neon:ep-cool-river-123456/ai_pharmacy_test');
-    allowed({ DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/dev', TEST_DATABASE_URL: 'postgresql://u:p@localhost/dev_test' });
+    allowed({ PROTECTED_DATABASE_IDENTITIES: 'loopback:5432/production', DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/dev', TEST_DATABASE_URL: 'postgresql://u:p@localhost/dev_test' });
   });
 
   it('different Neon endpoints (separate branches or projects)', () => {
@@ -106,9 +181,15 @@ describe('integration DB gate in the test helpers', () => {
   const testDb = 'postgresql://u:p@ep-quiet-lake-654321-pooler.c-2.us-east-2.aws.neon.tech/ai_pharmacy_test';
   it('is closed unless the runner verified this exact database', () => {
     assert.equal(integrationGate({}).available, false);
-    assert.equal(integrationGate({ TEST_DATABASE_URL: testDb, DATABASE_URL: testDb }).available, false, 'equal URLs alone are not enough');
-    assert.equal(integrationGate({ TEST_DATABASE_URL: testDb, DATABASE_URL: testDb, [VERIFIED_IDENTITY_ENV]: 'neon:ep-other/ai_pharmacy_test' }).available, false);
-    assert.equal(integrationGate({ TEST_DATABASE_URL: testDb, DATABASE_URL: NEON_DIRECT, [VERIFIED_IDENTITY_ENV]: 'neon:ep-quiet-lake-654321/ai_pharmacy_test' }).available, false);
-    assert.equal(integrationGate({ TEST_DATABASE_URL: testDb, DATABASE_URL: testDb, [VERIFIED_IDENTITY_ENV]: 'neon:ep-quiet-lake-654321/ai_pharmacy_test' }).available, true);
+    assert.equal(integrationGate(withProtected({ TEST_DATABASE_URL: testDb, DATABASE_URL: testDb })).available, false, 'equal URLs alone are not enough');
+    assert.equal(integrationGate(withProtected({ TEST_DATABASE_URL: testDb, DATABASE_URL: testDb, [VERIFIED_IDENTITY_ENV]: 'neon:ep-other/ai_pharmacy_test' })).available, false);
+    assert.equal(integrationGate(withProtected({ TEST_DATABASE_URL: testDb, DATABASE_URL: NEON_DIRECT, [VERIFIED_IDENTITY_ENV]: 'neon:ep-quiet-lake-654321/ai_pharmacy_test' })).available, false);
+    assert.equal(integrationGate(withProtected({ TEST_DATABASE_URL: testDb, DATABASE_URL: testDb, [VERIFIED_IDENTITY_ENV]: 'neon:ep-quiet-lake-654321/ai_pharmacy_test' })).available, true);
+  });
+
+  it('stays closed for a protected database or without protected identities, even with the verified identity set by hand', () => {
+    const verified = { TEST_DATABASE_URL: testDb, DATABASE_URL: testDb, [VERIFIED_IDENTITY_ENV]: 'neon:ep-quiet-lake-654321/ai_pharmacy_test' };
+    assert.equal(integrationGate(verified).available, false, 'no PROTECTED_DATABASE_IDENTITIES');
+    assert.equal(integrationGate({ ...verified, PROTECTED_DATABASE_IDENTITIES: 'neon:ep-quiet-lake-654321/*' }).available, false, 'protected');
   });
 });

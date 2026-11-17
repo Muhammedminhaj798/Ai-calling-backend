@@ -22,7 +22,7 @@ beforeEach(() => {
     customers: [customer({ phone: CALLER, name: 'Sample Medicals', preferredLanguage: 'ml' })],
     products: [product({ name: 'Dolo 650', stock: 100 }), product({ name: 'Dolo 500', strength: '500 mg', stock: 100 }), product({ name: 'Mockzine 10', strength: '10 mg', stock: 'error' })],
   });
-  store = createFakeStore();
+  store = createFakeStore({ backend }); // the end transaction reads the call's order and raises its exception
   orchestrator = createOrchestrator({ ai, backend, store, defaultLanguage: 'en', maxToolRounds: 6 });
   session = orchestrator.createSession({ callId: 'call-1', provider: 'simulator', providerCallSid: 'sim-1', fromNumber: CALLER });
 });

@@ -16,6 +16,8 @@ export const orderDetailInclude = {
     where: { status: { in: ['open', 'in_progress'] } },
     select: { id: true, type: true, status: true, description: true, orderItemId: true, assignedTo: true },
   },
+  // The originating call's provider tells staff when an order came from a test call (simulator, mock, LiveKit browser).
+  call: { select: { id: true, provider: true } },
 } satisfies Prisma.OrderInclude;
 
 export type OrderDetailRecord = Prisma.OrderGetPayload<{ include: typeof orderDetailInclude }>;
@@ -26,6 +28,7 @@ const listInclude = {
     select: { id: true, lineNo: true, nameSnapshot: true, requestedText: true, quantity: true, status: true, stockStatus: true, customerDecision: true },
   },
   customer: { select: { id: true, externalCode: true, name: true } },
+  call: { select: { id: true, provider: true } },
 } satisfies Prisma.OrderInclude;
 
 export const ordersRepository = {

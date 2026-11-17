@@ -31,7 +31,10 @@ function assertOpen(exception: ExceptionRecord): void {
 }
 
 export const exceptionsService = {
-  /** Internal: raise an exception from system code (orders, reservations, AI). Never throws on audit failure. */
+  /**
+   * Internal: raise an exception from system code (orders, reservations, AI). Never throws on audit failure, except
+   * inside a transaction (`db` a transaction client): there the audit row commits or rolls back with the exception.
+   */
   async raise(input: RaiseExceptionInput, actor: Actor, db: Db = prisma): Promise<ExceptionRecord> {
     const exception = await repo.create(db, {
       type: input.type,
@@ -49,7 +52,7 @@ export const exceptionsService = {
       entityType: 'exception',
       entityId: exception.id,
       after: { type: input.type, orderId: input.orderId ?? null, orderItemId: input.orderItemId ?? null },
-    });
+    }, db === prisma ? undefined : db);
     return exception;
   },
 
